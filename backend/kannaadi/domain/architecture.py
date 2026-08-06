@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 class ComponentKind(StrEnum):
     EMBEDDING = "embedding"
+    NORMALIZATION = "normalization"
+    RESIDUAL = "residual"
     ATTENTION = "attention"
     HEAD = "head"
     MLP = "mlp"
@@ -48,14 +50,19 @@ class ComponentNode(BaseModel):
 
 
 class LayerNode(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
     id: str
     index: int
     label: str
+    residual_pre: ComponentNode = Field(alias="residualPre")
+    norm1: ComponentNode
     attention: ComponentNode
     heads: list[ComponentNode]
+    residual_mid: ComponentNode = Field(alias="residualMid")
+    norm2: ComponentNode
     mlp: ComponentNode
+    residual_post: ComponentNode = Field(alias="residualPost")
 
 
 class ArchitectureGraph(BaseModel):
@@ -66,10 +73,18 @@ class ArchitectureGraph(BaseModel):
     family: str
     n_layers: int = Field(alias="nLayers", gt=0)
     n_heads: int = Field(alias="nHeads", gt=0)
+    n_key_value_heads: int = Field(alias="nKeyValueHeads", gt=0)
     d_model: int = Field(alias="dModel", gt=0)
+    d_head: int = Field(alias="dHead", gt=0)
+    d_mlp: int | None = Field(alias="dMlp", default=None)
     vocabulary_size: int = Field(alias="vocabularySize", gt=0)
+    norm_type: str = Field(alias="normType")
+    normalization_position: Literal["pre", "post"] = Field(alias="normalizationPosition")
+    block_topology: Literal["serial", "parallel"] = Field(alias="blockTopology")
+    positional_mechanism: str = Field(alias="positionalMechanism")
     embedding: ComponentNode
     layers: list[LayerNode]
+    final_norm: ComponentNode = Field(alias="finalNorm")
     unembedding: ComponentNode
 
     @model_validator(mode="after")
@@ -78,4 +93,6 @@ class ArchitectureGraph(BaseModel):
             raise ValueError("nLayers must match the number of layer nodes")
         if any(len(layer.heads) != self.n_heads for layer in self.layers):
             raise ValueError("every layer must expose nHeads head nodes")
+        if self.n_key_value_heads > self.n_heads:
+            raise ValueError("nKeyValueHeads cannot exceed nHeads")
         return self
