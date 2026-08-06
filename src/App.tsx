@@ -182,7 +182,7 @@ function TopBar({
       <button
         className="run-button"
         onClick={onLoad}
-        disabled={loading || runtime?.loadState === "loading"}
+        disabled={loading || runtime?.loadState === "loading" || Boolean(architecture)}
         title={architecture ? "Prompt execution is introduced in Milestone B" : "Load the selected model"}
       >
         {loading ? <span className="spinner" /> : architecture ? <Play size={14} fill="currentColor" /> : <Download size={14} />}
