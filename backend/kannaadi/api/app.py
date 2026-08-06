@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import importlib.util
+from pathlib import Path
+import re
 import threading
 from typing import Literal
 
@@ -12,7 +14,18 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from kannaadi.adapters import TransformerLensAdapter
-from kannaadi.domain import ArchitectureGraph, ModelSpec
+from kannaadi.domain import (
+    ActivationSeries,
+    ArchitectureGraph,
+    AttentionResult,
+    InterventionSpec,
+    ModelSpec,
+    ResidualStreamResult,
+    RunComparison,
+    RunRecord,
+    RunRequest,
+)
+from kannaadi.experiments import ExperimentEngine
 
 
 class ModelCatalogEntry(BaseModel):
@@ -30,10 +43,16 @@ class LoadModelRequest(BaseModel):
     dtype: Literal["float32", "float16", "bfloat16"] | None = None
 
 
+class RegisterModelRequest(BaseModel):
+    source: str
+    displayName: str | None = None
+
+
 class RuntimeState:
     def __init__(self) -> None:
         self.lock = threading.Lock()
         self.adapter: TransformerLensAdapter | None = None
+        self.experiments: ExperimentEngine | None = None
         self.loaded_model_id: str | None = None
         self.loaded_model_name: str | None = None
         self.device = "cpu"
@@ -49,6 +68,7 @@ class RuntimeState:
                 adapter.load(spec)
                 graph = adapter.architecture()
                 self.adapter = adapter
+                self.experiments = ExperimentEngine(adapter, graph, spec)
                 self.loaded_model_id = spec.id
                 self.loaded_model_name = spec.display_name
                 self.device = spec.device
@@ -56,6 +76,7 @@ class RuntimeState:
                 return graph
             except Exception as exc:
                 self.adapter = None
+                self.experiments = None
                 self.loaded_model_id = None
                 self.loaded_model_name = None
                 self.load_state = "error"
@@ -73,7 +94,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.2.0")
+app = FastAPI(title="Kannaadi API", version="0.3.0")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -127,12 +148,54 @@ def status(request: Request) -> dict[str, object]:
         "loadedModelName": runtime.loaded_model_name,
         "loadState": runtime.load_state,
         "loadError": runtime.load_error,
+        "runCount": len(runtime.experiments.list_runs()) if runtime.experiments else 0,
+        "cacheBytes": sum(run.cache_bytes for run in runtime.experiments.list_runs()) if runtime.experiments else 0,
     }
 
 
 @app.get("/api/v1/models", response_model=list[ModelCatalogEntry])
 def list_models() -> list[ModelCatalogEntry]:
     return [item["entry"] for item in MODEL_CATALOG.values()]
+
+
+@app.post("/api/v1/models/register", response_model=ModelCatalogEntry)
+def register_model(payload: RegisterModelRequest) -> ModelCatalogEntry:
+    source = payload.source.strip()
+    if not source:
+        raise HTTPException(status_code=400, detail="Enter a TransformerLens model name or local Hugging Face directory")
+    candidate_path = Path(source).expanduser()
+    is_local = candidate_path.exists()
+    if is_local and not candidate_path.is_dir():
+        raise HTTPException(status_code=400, detail="Local models must be Hugging Face-format directories, not individual weight files")
+    canonical_source = str(candidate_path.resolve()) if is_local else source
+    slug = re.sub(r"[^a-zA-Z0-9._-]+", "-", candidate_path.name if is_local else source).strip("-").lower()
+    if not slug:
+        raise HTTPException(status_code=400, detail="The model source could not be converted into an identifier")
+    model_id = slug
+    suffix = 2
+    while model_id in MODEL_CATALOG and (
+        MODEL_CATALOG[model_id]["spec"].repository != canonical_source
+        and MODEL_CATALOG[model_id]["spec"].local_path != canonical_source
+    ):
+        model_id = f"{slug}-{suffix}"
+        suffix += 1
+    display_name = payload.displayName.strip() if payload.displayName else candidate_path.name if is_local else source.split("/")[-1]
+    spec = ModelSpec(
+        id=model_id,
+        display_name=display_name,
+        backend="transformer_lens",
+        repository=None if is_local else canonical_source,
+        local_path=canonical_source if is_local else None,
+    )
+    entry = ModelCatalogEntry(
+        id=model_id,
+        displayName=display_name,
+        repository=canonical_source,
+        architectureFamily="TransformerLens-compatible",
+        parameterCount="unknown",
+    )
+    MODEL_CATALOG[model_id] = {"spec": spec, "entry": entry}
+    return entry
 
 
 @app.post("/api/v1/models/{model_id}/load", response_model=ArchitectureGraph, response_model_by_alias=True)
@@ -164,3 +227,109 @@ def architecture(model_id: str, request: Request) -> ArchitectureGraph:
     if runtime.adapter is None or runtime.loaded_model_id != model_id:
         raise HTTPException(status_code=409, detail=f"Model '{model_id}' is not loaded")
     return runtime.adapter.architecture()
+
+
+def experiment_engine(request: Request) -> ExperimentEngine:
+    runtime: RuntimeState = request.app.state.runtime
+    if runtime.experiments is None or runtime.adapter is None:
+        raise HTTPException(status_code=409, detail="Load a model before running an experiment")
+    return runtime.experiments
+
+
+def run_error(exc: Exception) -> HTTPException:
+    if isinstance(exc, KeyError):
+        return HTTPException(status_code=404, detail=str(exc).strip("'"))
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=500, detail=f"Experiment failed: {exc}")
+
+
+@app.get("/api/v1/runs", response_model=list[RunRecord], response_model_by_alias=True)
+def list_runs(request: Request) -> list[RunRecord]:
+    return experiment_engine(request).list_runs()
+
+
+@app.post("/api/v1/runs", response_model=RunRecord, response_model_by_alias=True)
+async def create_run(payload: RunRequest, request: Request) -> RunRecord:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(engine.run_clean, payload.prompt, top_k=payload.top_k, seed=payload.seed)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get("/api/v1/runs/{run_id}", response_model=RunRecord, response_model_by_alias=True)
+def get_run(run_id: str, request: Request) -> RunRecord:
+    try:
+        return experiment_engine(request).get_run(run_id)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post("/api/v1/runs/{run_id}/zero-ablate", response_model=RunRecord, response_model_by_alias=True)
+async def zero_ablate(run_id: str, payload: InterventionSpec, request: Request) -> RunRecord:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.zero_ablate,
+            run_id,
+            payload.component_ids,
+            token_scope=payload.token_scope,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/runs/{run_id}/attention/{layer}/{head}",
+    response_model=AttentionResult,
+    response_model_by_alias=True,
+)
+def attention(run_id: str, layer: int, head: int, request: Request) -> AttentionResult:
+    try:
+        return experiment_engine(request).attention(run_id, layer, head)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get("/api/v1/runs/{run_id}/activation", response_model=ActivationSeries, response_model_by_alias=True)
+def activation(run_id: str, component_id: str, request: Request) -> ActivationSeries:
+    try:
+        return experiment_engine(request).activation(run_id, component_id)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/runs/{run_id}/residual-stream",
+    response_model=ResidualStreamResult,
+    response_model_by_alias=True,
+)
+async def residual_stream(
+    run_id: str,
+    request: Request,
+    position: int = -1,
+    target_token_id: int | None = None,
+) -> ResidualStreamResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.residual_stream,
+            run_id,
+            position=position,
+            target_token_id=target_token_id,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/runs/{baseline_run_id}/compare/{intervened_run_id}",
+    response_model=RunComparison,
+    response_model_by_alias=True,
+)
+def compare_runs(baseline_run_id: str, intervened_run_id: str, request: Request) -> RunComparison:
+    try:
+        return experiment_engine(request).compare(baseline_run_id, intervened_run_id)
+    except Exception as exc:
+        raise run_error(exc) from exc

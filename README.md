@@ -4,18 +4,22 @@ Kannaadi is a desktop-first visual workbench for mechanistic interpretability. I
 
 ## Current milestone
 
-Milestone A establishes the native application and an honest, model-derived architecture view.
+Version 0.3 completes the first end-to-end scientific workflow: load a real model, execute a prompt, inspect a head's real attention pattern, zero-ablate it, compare the resulting output distribution, and view equivalent TransformerLens code.
 
 - Native Windows window with desktop-owned sidecar startup and shutdown
 - Loopback-only FastAPI service on a reserved per-launch port
 - Per-launch bearer token passed directly from the native process to the webview
 - Real TransformerLens model loading; production UI never falls back to invented architecture data
 - Canonical component identities such as `blocks.5.attn.head.3`
-- Residual stream, normalization, attention heads, MLPs, and final normalization represented from the loaded model configuration
-- Selectable, zoomable, pannable architecture canvas with inspector and context actions
-- Clear unavailable and not-yet-implemented states for research results
-
-Prompt execution, activation heatmaps, run comparison, and interventions are Milestone B. Their UI surfaces are intentionally present but do not display fabricated results.
+- Token and positional embeddings, residual stream, normalization, attention heads, MLPs, final normalization, and unembedding represented from the loaded model configuration
+- Progressive component disclosure, including Q/K/V, attention scores, softmax patterns, weighted values, projected results, and MLP internals
+- Real tokenization, immutable run manifests, top next-token predictions, and server-side activation caches
+- Real attention-pattern and QK-score heatmaps for any selected cached head
+- Per-token activation magnitudes and a residual-stream logit lens
+- Exact all-token zero ablation through `hook_result`, with clean/intervened probability and logit comparisons
+- Generated TransformerLens Python for the current prompt, selected head, and intervention
+- Geometry-based Fit all, 5–200% zoom, trackpad pinch zoom, two-finger panning, and resizable persisted panels
+- Registration of another TransformerLens model name or compatible local Hugging Face-format directory
 
 ## Run the desktop app
 
@@ -95,6 +99,11 @@ The frontend consumes normalized domain objects and does not infer architecture 
 - `tests/` — frontend interaction and honest-state tests
 - `backend/tests/` — API, authentication, and architecture-contract tests
 
-## Known scope boundary
+## Known scope boundaries
 
-Model loading and architecture inspection are real. The Run button and intervention actions are staged for Milestone B; until execution is implemented, Kannaadi shows explanatory empty states rather than demo tensors, logits, or attention values.
+- Interactive caches are currently limited to 512 prompt tokens and live in memory for the current desktop session.
+- Zero ablation currently targets attention-head results at all token positions. Mean/resample ablation, position scopes, corrupted runs, and activation patching are the next causal workflow.
+- The normalized architecture renderer currently targets TransformerLens-compatible decoder-only models with attention/MLP blocks. Unsupported or unusual architectures may load in TransformerLens but still need a dedicated Kannaadi architecture adapter.
+- Model registration accepts TransformerLens identifiers and compatible local Hugging Face directories; a standalone weight file cannot describe enough topology to load safely.
+- TransformerLens 3.x is introducing `TransformerBridge`. Kannaadi keeps backend-specific behavior behind one adapter so the loading path can migrate without changing experiment manifests or the frontend.
+- Runs and panel layout are local. Durable workspace snapshots, datasets, patching, gradients, custom-script execution, and plugins remain future milestones.

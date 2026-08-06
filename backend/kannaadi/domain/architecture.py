@@ -14,6 +14,9 @@ class ComponentKind(StrEnum):
     HEAD = "head"
     MLP = "mlp"
     UNEMBEDDING = "unembedding"
+    PROJECTION = "projection"
+    ACTIVATION = "activation"
+    OPERATION = "operation"
 
 
 class ModelSpec(BaseModel):
@@ -41,6 +44,7 @@ class ComponentNode(BaseModel):
     head: int | None = None
     activation_points: list[str] = Field(default_factory=list, alias="activationPoints")
     metadata: dict[str, Any] = Field(default_factory=dict)
+    children: list[ComponentNode] = Field(default_factory=list)
 
     @model_validator(mode="after")
     def validate_head_coordinates(self) -> "ComponentNode":
@@ -83,6 +87,7 @@ class ArchitectureGraph(BaseModel):
     block_topology: Literal["serial", "parallel"] = Field(alias="blockTopology")
     positional_mechanism: str = Field(alias="positionalMechanism")
     embedding: ComponentNode
+    positional_embedding: ComponentNode | None = Field(alias="positionalEmbedding", default=None)
     layers: list[LayerNode]
     final_norm: ComponentNode = Field(alias="finalNorm")
     unembedding: ComponentNode
