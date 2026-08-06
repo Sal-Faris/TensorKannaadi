@@ -48,6 +48,7 @@ test("expands the model-derived preferred layer and selects its preferred head",
   render(<App />);
 
   const head = await screen.findByRole("button", { name: "Select L5H3" });
+  expect(screen.getByRole("button", { name: "Run" })).toBeDisabled();
   await user.click(head);
   expect(screen.getByRole("heading", { name: "L5H3" })).toBeInTheDocument();
   expect(screen.getByText("blocks.5.attn.head.3")).toBeInTheDocument();
