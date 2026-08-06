@@ -1,4 +1,7 @@
-from kannaadi.domain import TokenRecord
+import pytest
+
+from kannaadi.adapters import TransformerLensAdapter
+from kannaadi.domain import ModelSpec, TokenRecord
 from kannaadi.experiments import ExperimentEngine
 
 
@@ -26,3 +29,30 @@ def test_minimum_edit_alignment_represents_inserted_tokens_without_guessing() ->
     assert [pair.status for pair in alignment] == ["exact", "source_gap", "exact"]
     assert alignment[1].source_position is None
     assert alignment[1].destination_position == 1
+
+
+def test_intervention_ids_cover_heads_whole_mlps_and_individual_neurons() -> None:
+    architecture = TransformerLensAdapter.from_dimensions(
+        ModelSpec(id="test", display_name="Test", backend="transformer_lens"),
+        n_layers=2,
+        n_heads=3,
+        d_model=12,
+        d_head=4,
+        d_mlp=24,
+        vocabulary_size=101,
+    )
+    engine = ExperimentEngine(object(), architecture, object())
+
+    heads, mlps, neurons = engine._partition_intervenable_components([
+        "blocks.1.attn.head.2",
+        "blocks.0.mlp",
+        "blocks.1.mlp.neuron.23",
+    ])
+
+    assert heads == {1: {2}}
+    assert mlps == {0}
+    assert neurons == {1: {23}}
+    with pytest.raises(ValueError, match="outside the loaded architecture"):
+        engine._partition_intervenable_components(["blocks.1.mlp.neuron.24"])
+    with pytest.raises(ValueError, match="support attention-head IDs"):
+        engine._partition_intervenable_components(["blocks.0.attn"])

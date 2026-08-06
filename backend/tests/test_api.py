@@ -6,9 +6,14 @@ from kannaadi.adapters import TransformerLensAdapter
 from kannaadi.api.app import RuntimeState, app
 from kannaadi.domain import (
     AlignmentPair,
+    AttributionEffect,
+    AttributionResult,
     ContrastResult,
     InterventionResult,
+    MetricResult,
     ModelSpec,
+    MlpEffect,
+    MlpSweepResult,
     Prediction,
     RunRecord,
     TokenAlignment,
@@ -99,6 +104,46 @@ class ExperimentStub:
         assert kwargs["positions"] == [0]
         return InterventionResult(run=run_record("intervened", run_id))
 
+    @staticmethod
+    def metric(run_id="run_test"):
+        return MetricResult(
+            runId=run_id,
+            metric="logit_difference",
+            position=0,
+            targetTokenId=2,
+            targetToken=" Paris",
+            distractorTokenId=3,
+            distractorToken=" Berlin",
+            value=2.5,
+        )
+
+    def mlp_sweep(self, run_id, **kwargs):
+        assert run_id == "run_test"
+        assert kwargs["kind"] == "zero_ablation"
+        return MlpSweepResult(
+            runId=run_id,
+            kind="zero_ablation",
+            metric=self.metric(),
+            effects=[MlpEffect(componentId="blocks.1.mlp", layer=1, metricValue=1.75, delta=-.75)],
+            minimum=-.75,
+            maximum=-.75,
+            durationMs=18,
+        )
+
+    def direct_attribution(self, run_id, metric):
+        assert run_id == "run_test"
+        assert metric.target_token == " Paris"
+        return AttributionResult(
+            runId=run_id,
+            metric=self.metric(),
+            effects=[AttributionEffect(componentId="blocks.1.mlp", label="MLP L1", kind="mlp", layer=1, value=2.0, fraction=.8)],
+            componentSum=2.0,
+            remainder=.5,
+            minimum=.5,
+            maximum=2.0,
+            durationMs=12,
+        )
+
 
 @pytest.fixture(autouse=True)
 def reset_runtime():
@@ -134,6 +179,7 @@ def test_cpu_model_load_defaults_to_memory_efficient_bfloat16(monkeypatch) -> No
     assert captured["spec"].dtype == "bfloat16"
     status = client.get("/api/v1/status").json()
     assert status["dtype"] == "bfloat16"
+    assert {"loadStage", "loadMessage", "loadElapsedSeconds"} <= status.keys()
 
 
 def test_architecture_endpoint_returns_loaded_adapter_graph() -> None:
@@ -178,6 +224,18 @@ def test_desktop_token_protects_api_routes() -> None:
     response = client.get("/api/v1/status", headers={"Authorization": f"Bearer {'a' * 48}"})
     assert response.status_code == 200
     assert response.json()["backend"] == "ready"
+
+
+def test_browser_development_origins_can_reach_the_local_api() -> None:
+    response = client.options(
+        "/api/v1/status",
+        headers={
+            "Origin": "http://127.0.0.1:3000",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+    assert response.status_code == 200
+    assert response.headers["access-control-allow-origin"] == "http://127.0.0.1:3000"
 
 
 def test_prompt_run_requires_a_loaded_experiment_engine() -> None:
@@ -228,3 +286,28 @@ def test_contrast_and_position_scoped_mean_ablation_are_first_class_workflows() 
     )
     assert ablated.status_code == 200
     assert ablated.json()["run"]["kind"] == "intervened"
+
+
+def test_mlp_sweep_and_direct_attribution_are_first_class_api_workflows() -> None:
+    app.state.runtime.adapter = LoadedAdapter()
+    app.state.runtime.experiments = ExperimentStub()
+
+    sweep = client.post(
+        "/api/v1/runs/run_test/mlp-sweep",
+        json={
+            "kind": "zero_ablation",
+            "tokenScope": "all",
+            "positions": [],
+            "metric": {"targetToken": " Paris", "distractorToken": " Berlin", "position": -1},
+        },
+    )
+    assert sweep.status_code == 200
+    assert sweep.json()["effects"][0]["componentId"] == "blocks.1.mlp"
+
+    attribution = client.post(
+        "/api/v1/runs/run_test/direct-attribution",
+        json={"targetToken": " Paris", "distractorToken": " Berlin", "position": -1},
+    )
+    assert attribution.status_code == 200
+    assert attribution.json()["method"] == "direct_logit_attribution_fixed_final_norm"
+    assert attribution.json()["componentSum"] + attribution.json()["remainder"] == pytest.approx(2.5)

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from kannaadi.domain import ArchitectureGraph, ModelSpec
 
@@ -10,7 +10,7 @@ class ModelAdapter(ABC):
     """Backend-neutral contract used by the API and experiment engine."""
 
     @abstractmethod
-    def load(self, spec: ModelSpec) -> None: ...
+    def load(self, spec: ModelSpec, progress: Callable[[str, str], None] | None = None) -> None: ...
 
     @abstractmethod
     def architecture(self) -> ArchitectureGraph: ...

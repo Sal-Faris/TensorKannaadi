@@ -237,6 +237,72 @@ class HeadSweepResult(BaseModel):
     duration_ms: float = Field(alias="durationMs")
 
 
+class MlpEffect(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    component_id: str = Field(alias="componentId")
+    layer: int
+    metric_value: float = Field(alias="metricValue")
+    delta: float
+
+
+class MlpSweepRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    kind: Literal["zero_ablation", "mean_ablation"] = "zero_ablation"
+    token_scope: Literal["all", "positions"] = Field(alias="tokenScope", default="all")
+    positions: list[int] = Field(default_factory=list)
+    metric: MetricSpec
+
+    @model_validator(mode="after")
+    def validate_scope(self) -> "MlpSweepRequest":
+        if self.token_scope == "positions" and not self.positions:
+            raise ValueError("Choose one or more token positions for a position-scoped sweep")
+        return self
+
+
+class MlpSweepResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    run_id: str = Field(alias="runId")
+    kind: Literal["zero_ablation", "mean_ablation"]
+    metric: MetricResult
+    effects: list[MlpEffect]
+    minimum: float
+    maximum: float
+    duration_ms: float = Field(alias="durationMs")
+
+
+class AttributionEffect(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    component_id: str = Field(alias="componentId")
+    label: str
+    kind: Literal["embedding", "head", "mlp", "remainder"]
+    layer: int | None = None
+    head: int | None = None
+    value: float
+    fraction: float | None = None
+
+
+class AttributionResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    run_id: str = Field(alias="runId")
+    metric: MetricResult
+    method: Literal["direct_logit_attribution_fixed_final_norm"] = "direct_logit_attribution_fixed_final_norm"
+    effects: list[AttributionEffect]
+    component_sum: float = Field(alias="componentSum")
+    remainder: float
+    minimum: float
+    maximum: float
+    duration_ms: float = Field(alias="durationMs")
+    caveat: str = (
+        "Descriptive direct attribution under the observed final-normalization scale; "
+        "it is not a causal intervention or a path decomposition."
+    )
+
+
 class AttentionResult(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 

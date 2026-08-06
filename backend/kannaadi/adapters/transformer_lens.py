@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from kannaadi.adapters.base import ModelAdapter
 from kannaadi.domain import ArchitectureGraph, ComponentNode, LayerNode, ModelSpec
@@ -19,7 +19,9 @@ class TransformerLensAdapter(ModelAdapter):
             raise RuntimeError("model is not loaded")
         return self._model
 
-    def load(self, spec: ModelSpec) -> None:
+    def load(self, spec: ModelSpec, progress: Callable[[str, str], None] | None = None) -> None:
+        report = progress or (lambda _stage, _message: None)
+        report("importing_runtime", "Importing PyTorch and TransformerLens")
         try:
             import torch
             from transformer_lens import HookedTransformer
@@ -33,6 +35,7 @@ class TransformerLensAdapter(ModelAdapter):
         if dtype is None:
             raise ValueError(f"Unsupported dtype: {spec.dtype}")
         model_name = spec.local_path or spec.repository or spec.id
+        report("resolving_model", f"Resolving {model_name}")
         load_kwargs: dict[str, Any] = {"device": spec.device, "dtype": dtype}
         if spec.revision:
             load_kwargs["revision"] = spec.revision
@@ -46,6 +49,7 @@ class TransformerLensAdapter(ModelAdapter):
             if not reduced_precision
             else HookedTransformer.from_pretrained_no_processing
         )
+        report("loading_weights", "Loading model configuration, tokenizer, and weights")
         self._model = loader(model_name, **load_kwargs)
         # Centering the unembedding chooses TransformerLens' standard logit gauge.
         # Do it in place so bfloat16 target-logit effects retain useful resolution
@@ -56,9 +60,11 @@ class TransformerLensAdapter(ModelAdapter):
             and hasattr(self._model, "W_U")
             and not getattr(getattr(self._model, "cfg", None), "output_logits_soft_cap", None)
         ):
+            report("centering_unembedding", "Centering the unembedding in place")
             with torch.no_grad():
                 unembed_mean = self._model.W_U.mean(dim=-1, keepdim=True, dtype=torch.float32)
                 self._model.W_U.sub_(unembed_mean.to(self._model.W_U.dtype))
+        report("configuring_hooks", "Enabling per-head result hooks")
         self._model.set_use_attn_result(True)
         self._spec = spec
 
