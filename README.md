@@ -43,6 +43,15 @@ npm run desktop:dev
 
 Tauri starts and stops the private Python sidecar automatically. Set `KANNAADI_PYTHON` only when you need to point the shell at a different Python executable.
 
+Build and launch a standalone local executable:
+
+```powershell
+npm run desktop:build
+.\src-tauri\target\release\kannaadi.exe
+```
+
+Use the executable under `target\release`. A binary produced by plain `cargo build` under `target\debug` is a development shell: it expects the Vite server from `npm run dev` to be listening on `127.0.0.1:1420` and will show a connection-refused page when that server is absent.
+
 ## Browser-only frontend development
 
 The browser is a frontend development convenience, not the shipping product. Start the API explicitly, then Vite:
