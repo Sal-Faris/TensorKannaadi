@@ -1,72 +1,91 @@
 # Kannaadi
 
-Kannaadi is a programmable visual workbench for mechanistic interpretability research. This repository contains the first vertical milestone: a typed Python model adapter and architecture API plus a selectable React architecture canvas.
+Kannaadi is a desktop-first visual workbench for mechanistic interpretability. It combines a native Tauri shell, a React/TypeScript research interface, and a managed local Python sidecar powered by TransformerLens.
 
-## What works
+## Current milestone
 
-- Stable canonical component IDs such as `blocks.9.attn.head.6`
-- A backend-neutral `ModelAdapter` contract
-- A TransformerLens adapter for model loading, tokenization, execution, activation discovery, and architecture normalization
-- A metadata-only architecture endpoint that does not silently download a model
-- A responsive transformer canvas with semantic layer expansion and component selection
-- A right-side inspector showing exact component and activation-point identifiers
-- A built-in demo graph when the local backend is not running
+Milestone A establishes the native application and an honest, model-derived architecture view.
 
-## Local setup
+- Native Windows window with desktop-owned sidecar startup and shutdown
+- Loopback-only FastAPI service on a reserved per-launch port
+- Per-launch bearer token passed directly from the native process to the webview
+- Real TransformerLens model loading; production UI never falls back to invented architecture data
+- Canonical component identities such as `blocks.5.attn.head.3`
+- Residual stream, normalization, attention heads, MLPs, and final normalization represented from the loaded model configuration
+- Selectable, zoomable, pannable architecture canvas with inspector and context actions
+- Clear unavailable and not-yet-implemented states for research results
 
-### Frontend
+Prompt execution, activation heatmaps, run comparison, and interventions are Milestone B. Their UI surfaces are intentionally present but do not display fabricated results.
 
-Requires Node.js 22.13 or newer.
+## Run the desktop app
 
-```bash
+Prerequisites on Windows:
+
+- Node.js 22.13 or newer
+- Python 3.11 or newer
+- Rust stable with the MSVC toolchain
+- Visual Studio C++ Build Tools and Windows 10/11 SDK
+- WebView2 runtime
+
+Install the application dependencies:
+
+```powershell
 npm install
+python -m venv backend\.venv
+backend\.venv\Scripts\python -m pip install -e ".\backend[transformers,test]"
+```
+
+Start the native development build:
+
+```powershell
+npm run desktop:dev
+```
+
+Tauri starts and stops the private Python sidecar automatically. Set `KANNAADI_PYTHON` only when you need to point the shell at a different Python executable.
+
+## Browser-only frontend development
+
+The browser is a frontend development convenience, not the shipping product. Start the API explicitly, then Vite:
+
+```powershell
+$env:VITE_KANNAADI_API_TOKEN = "local-development-token-that-is-at-least-32-characters"
+$env:KANNAADI_API_TOKEN = $env:VITE_KANNAADI_API_TOKEN
+backend\.venv\Scripts\python -m kannaadi.sidecar --host 127.0.0.1 --port 8000 --token $env:KANNAADI_API_TOKEN
 npm run dev
 ```
 
-Open `http://localhost:3000`.
+Open `http://127.0.0.1:1420`.
 
-### Backend
+## Verification
 
-Requires Python 3.11 or newer.
-
-```bash
-cd backend
-python -m venv .venv
-.venv\\Scripts\\activate
-pip install -e ".[test]"
-uvicorn kannaadi.api.app:app --reload --port 8000
-```
-
-The frontend automatically reads `GET /api/v1/models/gpt2-small/architecture`. Add the optional model runtime only when you want actual TransformerLens loading:
-
-```bash
-pip install -e ".[transformers,test]"
-```
-
-Passing `?load=true` to the architecture endpoint performs the real model load. The default metadata route stays deterministic, fast, and network-free.
-
-## Tests
-
-```bash
+```powershell
+npm run build
 npm test
-cd backend
-pytest
+backend\.venv\Scripts\python -m pytest backend\tests
+cargo check --manifest-path src-tauri\Cargo.toml
 ```
 
-## Architecture decisions
+## Architecture
 
-- The browser consumes normalized domain objects and never depends on TransformerLens hook names beyond their appearance as metadata.
-- Head IDs are canonical even though TransformerLens stores all head results in one hook tensor; `metadata.slice` records the head-axis selection.
-- Pydantic models reject extra fields and validate graph dimensions to prevent a visually plausible but incorrect graph.
-- Real model loading is explicit because downloading weights is a material operation. Browsing known architecture metadata is not.
+```text
+Tauri desktop process
+  ├─ native application window (React + TypeScript)
+  └─ managed Python child process
+       └─ FastAPI + TransformerLens + PyTorch
+```
 
-## Current limitations
+The sidecar listens only on `127.0.0.1`. The native process reserves a free port, creates a fresh 48-character token, starts Python without a console window, streams logs, detects crashes, and terminates the child when the app exits. The webview receives the connection information through a Tauri command instead of a file or a fixed secret.
 
-- The catalog contains GPT-2 Small only.
-- The canvas is architecture-only; result overlays and intervention execution are not connected yet.
-- Model instances are not retained between requests yet.
-- The current API uses in-process execution and is not a job queue.
+The frontend consumes normalized domain objects and does not infer architecture from the selected model name. Head IDs remain canonical even though TransformerLens stores head outputs in a shared hook tensor; each head records its slice metadata.
 
-## Next milestone
+## Repository layout
 
-Add a model session service and prompt dataset flow: tokenize clean/corrupted pairs, run cached forward passes, and publish a labelled logit-difference result onto the existing canvas.
+- `src/` — desktop workbench UI and typed sidecar client
+- `src-tauri/` — native shell and sidecar lifecycle manager
+- `backend/kannaadi/` — API, normalized domain model, and TransformerLens adapter
+- `tests/` — frontend interaction and honest-state tests
+- `backend/tests/` — API, authentication, and architecture-contract tests
+
+## Known scope boundary
+
+Model loading and architecture inspection are real. The Run button and intervention actions are staged for Milestone B; until execution is implemented, Kannaadi shows explanatory empty states rather than demo tensors, logits, or attention values.

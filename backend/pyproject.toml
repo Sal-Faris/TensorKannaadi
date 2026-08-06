@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "kannaadi"
-version = "0.1.0"
+version = "0.2.0"
 description = "Python execution backend for the Kannaadi research workbench"
 requires-python = ">=3.11"
 dependencies = ["fastapi>=0.115,<1", "pydantic>=2.9,<3", "uvicorn[standard]>=0.30,<1"]
 
 [project.optional-dependencies]
-transformers = ["torch>=2.2", "transformer-lens>=2.11"]
-test = ["httpx>=0.27", "pytest>=8.3"]
+transformers = ["torch>=2.2,<3", "transformer-lens>=2.11,<4"]
+test = ["httpx2>=2,<3", "pytest>=8.3"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

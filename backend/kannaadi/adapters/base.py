@@ -7,7 +7,7 @@ from kannaadi.domain import ArchitectureGraph, ModelSpec
 
 
 class ModelAdapter(ABC):
-    """Backend-neutral contract used by the API and future experiment engine."""
+    """Backend-neutral contract used by the API and experiment engine."""
 
     @abstractmethod
     def load(self, spec: ModelSpec) -> None: ...
@@ -20,6 +20,9 @@ class ModelAdapter(ABC):
 
     @abstractmethod
     def run(self, tokens: Any, requested_activations: Iterable[str] | None = None) -> Any: ...
+
+    @abstractmethod
+    def install_intervention(self, spec: Any) -> Any: ...
 
     @abstractmethod
     def supported_activation_points(self) -> list[str]: ...
