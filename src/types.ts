@@ -5,7 +5,10 @@ export type ComponentKind =
   | "attention"
   | "head"
   | "mlp"
-  | "unembedding";
+  | "unembedding"
+  | "projection"
+  | "activation"
+  | "operation";
 
 export type ComponentNode = {
   id: string;
@@ -15,6 +18,7 @@ export type ComponentNode = {
   head?: number;
   activationPoints: string[];
   metadata: Record<string, unknown>;
+  children: ComponentNode[];
 };
 
 export type LayerNode = {
@@ -47,6 +51,7 @@ export type ArchitectureGraph = {
   blockTopology: "serial" | "parallel";
   positionalMechanism: string;
   embedding: ComponentNode;
+  positionalEmbedding: ComponentNode | null;
   layers: LayerNode[];
   finalNorm: ComponentNode;
   unembedding: ComponentNode;
@@ -63,6 +68,8 @@ export type RuntimeStatus = {
   loadedModelName: string | null;
   loadState: "idle" | "loading" | "loaded" | "error";
   loadError: string | null;
+  runCount: number;
+  cacheBytes: number;
 };
 
 export type ModelCatalogEntry = {
@@ -77,4 +84,113 @@ export type SidecarInfo = {
   baseUrl: string;
   token: string;
   state: string;
+};
+
+export type TokenRecord = {
+  position: number;
+  tokenId: number;
+  text: string;
+  display: string;
+  nextToken: string | null;
+  nextTokenProbability: number | null;
+};
+
+export type Prediction = {
+  tokenId: number;
+  text: string;
+  display: string;
+  logit: number;
+  probability: number;
+};
+
+export type InterventionSpec = {
+  kind: "zero_ablation";
+  componentIds: string[];
+  tokenScope: "all";
+};
+
+export type RunRecord = {
+  id: string;
+  kind: "clean" | "intervened";
+  label: string;
+  status: "complete";
+  modelId: string;
+  modelRevision: string | null;
+  prompt: string;
+  tokens: TokenRecord[];
+  topPredictions: Prediction[];
+  requestedActivations: string[];
+  interventions: InterventionSpec[];
+  parentRunId: string | null;
+  device: string;
+  dtype: string;
+  seed: number;
+  durationMs: number;
+  cacheBytes: number;
+  createdAt: string;
+  provenance: Record<string, unknown>;
+};
+
+export type AttentionResult = {
+  runId: string;
+  componentId: string;
+  layer: number;
+  head: number;
+  patternHook: string;
+  scoreHook: string;
+  queryTokens: string[];
+  keyTokens: string[];
+  pattern: number[][];
+  scores: number[][];
+  resultNorms: number[];
+  qNorms: number[];
+  kNorms: number[];
+  axes: ["query_token", "key_token"];
+};
+
+export type ActivationSeries = {
+  runId: string;
+  componentId: string;
+  hookName: string;
+  measure: string;
+  tokenLabels: string[];
+  values: number[];
+  axes: ["position"];
+};
+
+export type ResidualPoint = {
+  layer: number;
+  stage: "pre" | "mid" | "post";
+  norm: number;
+  targetLogit: number;
+};
+
+export type ResidualStreamResult = {
+  runId: string;
+  position: number;
+  targetTokenId: number;
+  targetToken: string;
+  points: ResidualPoint[];
+  method: "logit_lens";
+};
+
+export type TokenComparison = {
+  tokenId: number;
+  text: string;
+  display: string;
+  baselineLogit: number;
+  intervenedLogit: number;
+  deltaLogit: number;
+  baselineProbability: number;
+  intervenedProbability: number;
+  deltaProbability: number;
+};
+
+export type RunComparison = {
+  baselineRunId: string;
+  intervenedRunId: string;
+  baselineTopToken: string;
+  baselineTopTokenDelta: number;
+  klDivergence: number;
+  tokens: TokenComparison[];
 };

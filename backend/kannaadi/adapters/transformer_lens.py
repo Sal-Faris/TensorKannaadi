@@ -32,8 +32,12 @@ class TransformerLensAdapter(ModelAdapter):
         }.get(spec.dtype)
         if dtype is None:
             raise ValueError(f"Unsupported dtype: {spec.dtype}")
-        model_name = spec.repository or spec.id
-        self._model = HookedTransformer.from_pretrained(model_name, device=spec.device, dtype=dtype)
+        model_name = spec.local_path or spec.repository or spec.id
+        load_kwargs: dict[str, Any] = {"device": spec.device, "dtype": dtype}
+        if spec.revision:
+            load_kwargs["revision"] = spec.revision
+        self._model = HookedTransformer.from_pretrained(model_name, **load_kwargs)
+        self._model.set_use_attn_result(True)
         self._spec = spec
 
     def architecture(self) -> ArchitectureGraph:
@@ -77,7 +81,14 @@ class TransformerLensAdapter(ModelAdapter):
         layers: list[LayerNode] = []
         for layer in range(n_layers):
             residual_pre = ComponentNode(id=f"blocks.{layer}.resid_pre", label="Residual pre", kind="residual", layer=layer, activationPoints=[f"blocks.{layer}.hook_resid_pre"])
-            norm1 = ComponentNode(id=f"blocks.{layer}.ln1", label=norm_type, kind="normalization", layer=layer, activationPoints=[f"blocks.{layer}.ln1.hook_normalized"])
+            norm1 = ComponentNode(
+                id=f"blocks.{layer}.ln1", label=norm_type, kind="normalization", layer=layer,
+                activationPoints=[f"blocks.{layer}.ln1.hook_normalized"],
+                children=[
+                    ComponentNode(id=f"blocks.{layer}.ln1.scale", label="Scale", kind="operation", layer=layer, activationPoints=[f"blocks.{layer}.ln1.hook_scale"]),
+                    ComponentNode(id=f"blocks.{layer}.ln1.normalized", label="Normalized", kind="operation", layer=layer, activationPoints=[f"blocks.{layer}.ln1.hook_normalized"]),
+                ],
+            )
             attention = ComponentNode(id=f"blocks.{layer}.attn", label="Multi-Head Attention", kind="attention", layer=layer, activationPoints=[f"blocks.{layer}.attn.hook_pattern", f"blocks.{layer}.hook_attn_out"])
             heads = [
                 ComponentNode(
@@ -88,12 +99,37 @@ class TransformerLensAdapter(ModelAdapter):
                     head=head,
                     activationPoints=[f"blocks.{layer}.attn.hook_result"],
                     metadata={"slice": {"axis": "head", "index": head}, "d_head": resolved_d_head},
+                    children=[
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.q", label="Query", kind="projection", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_q"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.k", label="Key", kind="projection", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_k"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.v", label="Value", kind="projection", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_v"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.scores", label="Attention scores", kind="operation", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_attn_scores"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.pattern", label="Softmax pattern", kind="operation", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_pattern"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.z", label="Weighted values", kind="operation", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_z"], metadata={"slice": {"axis": "head", "index": head}}),
+                        ComponentNode(id=f"blocks.{layer}.attn.head.{head}.result", label="Result", kind="projection", layer=layer, head=head, activationPoints=[f"blocks.{layer}.attn.hook_result"], metadata={"slice": {"axis": "head", "index": head}}),
+                    ],
                 )
                 for head in range(n_heads)
             ]
             residual_mid = ComponentNode(id=f"blocks.{layer}.resid_mid", label="Residual mid", kind="residual", layer=layer, activationPoints=[f"blocks.{layer}.hook_resid_mid"])
-            norm2 = ComponentNode(id=f"blocks.{layer}.ln2", label=norm_type, kind="normalization", layer=layer, activationPoints=[f"blocks.{layer}.ln2.hook_normalized"])
-            mlp = ComponentNode(id=f"blocks.{layer}.mlp", label="MLP", kind="mlp", layer=layer, activationPoints=[f"blocks.{layer}.hook_mlp_out"], metadata={"activation": activation, "d_mlp": d_mlp})
+            norm2 = ComponentNode(
+                id=f"blocks.{layer}.ln2", label=norm_type, kind="normalization", layer=layer,
+                activationPoints=[f"blocks.{layer}.ln2.hook_normalized"],
+                children=[
+                    ComponentNode(id=f"blocks.{layer}.ln2.scale", label="Scale", kind="operation", layer=layer, activationPoints=[f"blocks.{layer}.ln2.hook_scale"]),
+                    ComponentNode(id=f"blocks.{layer}.ln2.normalized", label="Normalized", kind="operation", layer=layer, activationPoints=[f"blocks.{layer}.ln2.hook_normalized"]),
+                ],
+            )
+            mlp = ComponentNode(
+                id=f"blocks.{layer}.mlp", label="MLP", kind="mlp", layer=layer,
+                activationPoints=[f"blocks.{layer}.hook_mlp_out"],
+                metadata={"activation": activation, "d_mlp": d_mlp},
+                children=[
+                    ComponentNode(id=f"blocks.{layer}.mlp.in", label="Linear in", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_pre"]),
+                    ComponentNode(id=f"blocks.{layer}.mlp.activation", label=activation, kind="activation", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_post"]),
+                    ComponentNode(id=f"blocks.{layer}.mlp.out", label="Linear out", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.hook_mlp_out"]),
+                ],
+            )
             residual_post = ComponentNode(id=f"blocks.{layer}.resid_post", label="Residual post", kind="residual", layer=layer, activationPoints=[f"blocks.{layer}.hook_resid_post"])
             layers.append(LayerNode(
                 id=f"blocks.{layer}", index=layer, label=f"Layer {layer}", residualPre=residual_pre,
@@ -116,9 +152,23 @@ class TransformerLensAdapter(ModelAdapter):
             blockTopology=block_topology,
             positionalMechanism=positional_mechanism,
             embedding=ComponentNode(id="embed", label="Token embedding", kind="embedding", activationPoints=["hook_embed"]),
+            positionalEmbedding=(
+                ComponentNode(id="pos_embed", label="Positional embedding", kind="embedding", activationPoints=["hook_pos_embed"], metadata={"mechanism": positional_mechanism})
+                if positional_mechanism in {"standard", "shortformer"} else None
+            ),
             layers=layers,
-            finalNorm=ComponentNode(id="ln_final", label="Final normalization", kind="normalization", activationPoints=["ln_final.hook_normalized"]),
-            unembedding=ComponentNode(id="unembed", label="Unembedding", kind="unembedding", activationPoints=[]),
+            finalNorm=ComponentNode(
+                id="ln_final", label="Final normalization", kind="normalization",
+                activationPoints=["ln_final.hook_normalized"],
+                children=[
+                    ComponentNode(id="ln_final.scale", label="Scale", kind="operation", activationPoints=["ln_final.hook_scale"]),
+                    ComponentNode(id="ln_final.normalized", label="Normalized", kind="operation", activationPoints=["ln_final.hook_normalized"]),
+                ],
+            ),
+            unembedding=ComponentNode(
+                id="unembed", label="Unembedding", kind="unembedding",
+                activationPoints=["unembed.hook_in", "unembed.hook_out"],
+            ),
         )
 
     def tokenize(self, prompts: Iterable[str]) -> Any:
@@ -131,7 +181,7 @@ class TransformerLensAdapter(ModelAdapter):
         return self.model(tokens)
 
     def install_intervention(self, spec: Any) -> Any:
-        raise NotImplementedError("Intervention installation is introduced in Milestone B")
+        raise NotImplementedError("Persistent adapter interventions are not installed directly; use an experiment run specification")
 
     def supported_activation_points(self) -> list[str]:
         return sorted(self.model.hook_dict.keys())

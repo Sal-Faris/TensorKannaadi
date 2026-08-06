@@ -1,4 +1,14 @@
-import type { ArchitectureGraph, ModelCatalogEntry, RuntimeStatus, SidecarInfo } from "./types";
+import type {
+  ActivationSeries,
+  ArchitectureGraph,
+  AttentionResult,
+  ModelCatalogEntry,
+  ResidualStreamResult,
+  RunComparison,
+  RunRecord,
+  RuntimeStatus,
+  SidecarInfo,
+} from "./types";
 
 const BROWSER_API = import.meta.env.VITE_KANNAADI_API_URL || "http://127.0.0.1:8000";
 const BROWSER_TOKEN = import.meta.env.VITE_KANNAADI_API_TOKEN || "";
@@ -44,6 +54,13 @@ export class KannaadiApi {
     return this.request("/api/v1/models");
   }
 
+  registerModel(source: string, displayName?: string): Promise<ModelCatalogEntry> {
+    return this.request("/api/v1/models/register", {
+      method: "POST",
+      body: JSON.stringify({ source, displayName }),
+    });
+  }
+
   architecture(modelId: string): Promise<ArchitectureGraph> {
     return this.request(`/api/v1/models/${encodeURIComponent(modelId)}/architecture`);
   }
@@ -53,6 +70,41 @@ export class KannaadiApi {
       method: "POST",
       body: JSON.stringify({ device }),
     });
+  }
+
+  runs(): Promise<RunRecord[]> {
+    return this.request("/api/v1/runs");
+  }
+
+  run(prompt: string, topK = 10): Promise<RunRecord> {
+    return this.request("/api/v1/runs", {
+      method: "POST",
+      body: JSON.stringify({ prompt, topK, seed: 0 }),
+    });
+  }
+
+  zeroAblate(runId: string, componentIds: string[]): Promise<RunRecord> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/zero-ablate`, {
+      method: "POST",
+      body: JSON.stringify({ kind: "zero_ablation", componentIds, tokenScope: "all" }),
+    });
+  }
+
+  attention(runId: string, layer: number, head: number): Promise<AttentionResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/attention/${layer}/${head}`);
+  }
+
+  activation(runId: string, componentId: string): Promise<ActivationSeries> {
+    const query = new URLSearchParams({ component_id: componentId });
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/activation?${query}`);
+  }
+
+  residualStream(runId: string): Promise<ResidualStreamResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/residual-stream`);
+  }
+
+  compare(baselineRunId: string, intervenedRunId: string): Promise<RunComparison> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(baselineRunId)}/compare/${encodeURIComponent(intervenedRunId)}`);
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
