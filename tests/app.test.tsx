@@ -157,6 +157,36 @@ test("fits the complete expanded diagram instead of resetting to a preset zoom",
   expect(small.zoom).toBe(1);
 });
 
+test("supports Ctrl multi-selection and opens the complete selection manager", async () => {
+  mockConnectedBackend();
+  render(<App />);
+
+  const initiallySelected = await screen.findByRole("button", { name: "Select L5H3" });
+  await waitFor(() => expect(initiallySelected).toHaveClass("component-selected"));
+  fireEvent.click(screen.getByRole("button", { name: "Select L5H0" }), { ctrlKey: true });
+  fireEvent.click(screen.getByRole("button", { name: "Select L5H1" }), { ctrlKey: true });
+  fireEvent.click(screen.getByRole("button", { name: "Select L5H2" }), { ctrlKey: true });
+  fireEvent.click(screen.getByRole("button", { name: "Expand layer 4" }));
+  fireEvent.click(screen.getByRole("button", { name: "Select L4H0" }), { ctrlKey: true });
+
+  fireEvent.click(screen.getByRole("button", { name: "View all 5" }));
+  expect(screen.getByRole("heading", { name: "Current selection" })).toBeInTheDocument();
+  expect(screen.getByText("5 components. Shift-, Ctrl-, or Command-click components to toggle them.")).toBeInTheDocument();
+  expect(screen.getAllByText("blocks.4.attn.head.0").length).toBeGreaterThan(0);
+});
+
+test("exposes whole-MLP and neuron controls without an empty head index", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByTitle("blocks.5.mlp"));
+  expect(screen.getByRole("heading", { name: "MLP L5" })).toBeInTheDocument();
+  expect(screen.queryByText("Head Index")).not.toBeInTheDocument();
+  expect(screen.getByRole("spinbutton", { name: "Neuron index" })).toHaveValue(0);
+  expect(screen.getByRole("button", { name: "Sweep all MLPs" })).toBeDisabled();
+});
+
 test("runs a clean and corrupted contrast and exposes its token alignment", async () => {
   mockResearchBackend();
   const user = userEvent.setup();

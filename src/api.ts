@@ -2,11 +2,13 @@ import type {
   ActivationSeries,
   ArchitectureGraph,
   AttentionResult,
+  AttributionResult,
   ContrastResult,
   HeadSweepResult,
   InterventionResult,
   MetricResult,
   MetricSpec,
+  MlpSweepResult,
   ModelCatalogEntry,
   ResidualStreamResult,
   RunComparison,
@@ -48,6 +50,18 @@ export class KannaadiApi {
       }
     }
     throw lastError instanceof Error ? lastError : new Error("Sidecar did not become ready");
+  }
+
+  async restartDesktop(): Promise<void> {
+    if (!("__TAURI_INTERNALS__" in window)) {
+      throw new Error("Automatic service restart is only available in the desktop app");
+    }
+    const { invoke } = await import("@tauri-apps/api/core");
+    const sidecar = await invoke<SidecarInfo>("restart_sidecar");
+    this.baseUrl = sidecar.baseUrl;
+    this.token = sidecar.token;
+    this.runtime = "desktop";
+    await this.request("/health", { signal: AbortSignal.timeout(3_000) });
   }
 
   async status(): Promise<RuntimeStatus> {
@@ -155,6 +169,30 @@ export class KannaadiApi {
         positions: positions ?? [],
         metric,
       }),
+    });
+  }
+
+  mlpSweep(
+    runId: string,
+    kind: "zero_ablation" | "mean_ablation",
+    positions: number[] | null,
+    metric: MetricSpec,
+  ): Promise<MlpSweepResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/mlp-sweep`, {
+      method: "POST",
+      body: JSON.stringify({
+        kind,
+        tokenScope: positions ? "positions" : "all",
+        positions: positions ?? [],
+        metric,
+      }),
+    });
+  }
+
+  directAttribution(runId: string, metric: MetricSpec): Promise<AttributionResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/direct-attribution`, {
+      method: "POST",
+      body: JSON.stringify(metric),
     });
   }
 

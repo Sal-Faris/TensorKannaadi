@@ -69,6 +69,9 @@ export type RuntimeStatus = {
   loadedModelName: string | null;
   loadState: "idle" | "loading" | "loaded" | "error";
   loadError: string | null;
+  loadStage: string;
+  loadMessage: string;
+  loadElapsedSeconds: number;
   runCount: number;
   cacheBytes: number;
 };
@@ -270,6 +273,46 @@ export type HeadSweepResult = {
   minimum: number;
   maximum: number;
   durationMs: number;
+};
+
+export type MlpEffect = {
+  componentId: string;
+  layer: number;
+  metricValue: number;
+  delta: number;
+};
+
+export type MlpSweepResult = {
+  runId: string;
+  kind: "zero_ablation" | "mean_ablation";
+  metric: MetricResult;
+  effects: MlpEffect[];
+  minimum: number;
+  maximum: number;
+  durationMs: number;
+};
+
+export type AttributionEffect = {
+  componentId: string;
+  label: string;
+  kind: "embedding" | "head" | "mlp" | "remainder";
+  layer: number | null;
+  head: number | null;
+  value: number;
+  fraction: number | null;
+};
+
+export type AttributionResult = {
+  runId: string;
+  metric: MetricResult;
+  method: "direct_logit_attribution_fixed_final_norm";
+  effects: AttributionEffect[];
+  componentSum: number;
+  remainder: number;
+  minimum: number;
+  maximum: number;
+  durationMs: number;
+  caveat: string;
 };
 
 export type ComponentGroup = {

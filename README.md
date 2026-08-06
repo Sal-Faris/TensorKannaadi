@@ -4,13 +4,14 @@ Kannaadi is a desktop-first visual workbench for mechanistic interpretability. I
 
 ## Current milestone
 
-Version 0.4.1 adds a low-memory desktop loading path to the 0.4 causal-research workflow: define a clean/corrupted contrast, review tokenizer alignment, choose an explicit logit metric, patch or ablate selected heads at chosen token positions, and sweep every head in the model.
+Version 0.5.0 expands Kannaadi into a component-level research workbench: define a clean/corrupted contrast, review tokenizer alignment, intervene on attention heads, whole MLP blocks, or individual neurons, sweep full component classes, compute direct logit attribution, and export a reproducible result bundle.
 
 - Native Windows window with desktop-owned sidecar startup and shutdown
 - Loopback-only FastAPI service on a reserved per-launch port
 - Per-launch bearer token passed directly from the native process to the webview
 - Real TransformerLens model loading; production UI never falls back to invented architecture data
 - Memory-efficient CPU loading with bfloat16, TransformerLens' centered-unembedding logit gauge, and explicit runtime precision
+- Truthful stage-based model-loading progress, non-blocking service status, and in-app desktop-service recovery
 - Canonical component identities such as `blocks.5.attn.head.3`
 - Token and positional embeddings, residual stream, normalization, attention heads, MLPs, final normalization, and unembedding represented from the loaded model configuration
 - Progressive component disclosure, including Q/K/V, attention scores, softmax patterns, weighted values, projected results, and MLP internals
@@ -21,12 +22,17 @@ Version 0.4.1 adds a low-memory desktop loading path to the 0.4 causal-research 
 - Explicit target-logit or target-minus-distractor logit metrics with strict single-token validation
 - Exact zero ablation and within-prompt mean ablation through `hook_result`, at all or selected token positions
 - Exact clean-to-corrupted activation patching with persisted source/destination token mappings
+- Exact zero/within-prompt-mean ablation and clean-to-corrupted patching for whole MLPs and individual post-activation neurons
 - Vectorized whole-model head sweeps: one batched forward pass per layer rather than one pass per head
-- Diverging causal-effect overlays on expanded heads and a complete layer-by-head sweep heatmap
-- Named component groups for repeatable multi-head interventions
+- Bounded-batch whole-model MLP sweeps, with diverging causal overlays and ranked effects
+- Direct logit attribution across embeddings, every attention head, every MLP, and an explicit reconciled remainder
+- Named component groups for repeatable multi-component interventions
 - Native workspace snapshots for prompts, metric setup, selections, groups, expanded components, and panel layout
-- Generated TransformerLens Python for zero ablation, mean ablation, and activation patching
+- Downloadable JSON research bundles containing architecture, run provenance, interventions, sweeps, attribution, selection, and groups
+- Generated TransformerLens Python for head, MLP, and neuron ablation or activation patching
 - Geometry-based Fit all, 5–200% zoom, trackpad pinch zoom, two-finger panning, and resizable persisted panels
+- Ctrl/Command/Shift multi-selection, box selection, and a searchable complete-selection manager
+- Explicit, model-faithful input and output boundaries: tokenizer outside the model, embeddings summed once into the initial residual, then final normalization and unembedding
 - Registration of another TransformerLens model name or compatible local Hugging Face-format directory
 
 ## Run the desktop app
@@ -84,6 +90,7 @@ npm run build
 npm test
 backend\.venv\Scripts\python -m pytest backend\tests
 cargo check --manifest-path src-tauri\Cargo.toml
+backend\.venv\Scripts\python backend\scripts\validate_research.py --model gpt2-small
 ```
 
 ## Architecture
@@ -104,15 +111,16 @@ The frontend consumes normalized domain objects and does not infer architecture 
 - `src/` — desktop workbench UI and typed sidecar client
 - `src-tauri/` — native shell and sidecar lifecycle manager
 - `backend/kannaadi/` — API, normalized domain model, and TransformerLens adapter
+- `backend/scripts/validate_research.py` — opt-in real-model research smoke test
 - `tests/` — frontend interaction and honest-state tests
 - `backend/tests/` — API, authentication, and architecture-contract tests
 
 ## Known scope boundaries
 
 - Interactive tensors are currently limited to 512 prompt tokens and live in memory for the current desktop session. Workspace metadata persists, while run tensors are deliberately recomputed after restart.
-- Current causal interventions target attention-head results. MLP/neuron patching, path patching, gradients, attribution patching, and dataset-scale statistics remain future workflows.
+- Current causal interventions target attention-head results, whole MLP outputs, and post-activation MLP neurons. Path patching, gradients, attribution patching, and dataset-scale statistics remain future workflows.
 - The normalized architecture renderer currently targets TransformerLens-compatible decoder-only models with attention/MLP blocks. Unsupported or unusual architectures may load in TransformerLens but still need a dedicated Kannaadi architecture adapter.
 - Model registration accepts TransformerLens identifiers and compatible local Hugging Face directories; a standalone weight file cannot describe enough topology to load safely.
 - TransformerLens 3.x is introducing `TransformerBridge`. Kannaadi keeps backend-specific behavior behind one adapter so the loading path can migrate without changing experiment manifests or the frontend.
 - Arbitrary custom-script execution is not enabled yet; generated TransformerLens code remains read-only so the desktop app does not silently execute untrusted Python. A future trusted/restricted code workflow should make that boundary explicit.
-- Dataset runners, resumable background jobs, experiment export bundles, plugins, installer signing, and unusual non-decoder architecture renderers remain future milestones.
+- Dataset runners, resumable background jobs, plugins, installer signing, and unusual non-decoder architecture renderers remain future milestones.

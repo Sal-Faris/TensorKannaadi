@@ -3,7 +3,9 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 import re
+import sys
 import threading
+import time
 from typing import Literal
 
 from fastapi import FastAPI, HTTPException, Request
@@ -19,6 +21,7 @@ from kannaadi.domain import (
     ActivationSeries,
     ArchitectureGraph,
     AttentionResult,
+    AttributionResult,
     ContrastRequest,
     ContrastResult,
     HeadSweepRequest,
@@ -27,6 +30,8 @@ from kannaadi.domain import (
     InterventionSpec,
     MetricResult,
     MetricSpec,
+    MlpSweepRequest,
+    MlpSweepResult,
     ModelSpec,
     PatchRequest,
     ResidualStreamResult,
@@ -69,15 +74,28 @@ class RuntimeState:
         self.dtype: str | None = None
         self.load_state: Literal["idle", "loading", "loaded", "error"] = "idle"
         self.load_error: str | None = None
+        self.load_stage = "idle"
+        self.load_message = "Choose a model to begin"
+        self.load_started_at: float | None = None
+        self.load_finished_at: float | None = None
+
+    def set_load_stage(self, stage: str, message: str) -> None:
+        self.load_stage = stage
+        self.load_message = message
 
     def load(self, spec: ModelSpec) -> ArchitectureGraph:
         with self.lock:
             self.load_state = "loading"
             self.load_error = None
+            self.load_started_at = time.perf_counter()
+            self.load_finished_at = None
+            self.set_load_stage("validating", "Validating the model request")
             try:
                 adapter = TransformerLensAdapter()
-                adapter.load(spec)
+                adapter.load(spec, self.set_load_stage)
+                self.set_load_stage("building_architecture", "Building the normalized architecture graph")
                 graph = adapter.architecture()
+                self.set_load_stage("initializing_experiments", "Initializing the experiment engine")
                 self.adapter = adapter
                 self.experiments = ExperimentEngine(adapter, graph, spec)
                 self.loaded_model_id = spec.id
@@ -85,6 +103,8 @@ class RuntimeState:
                 self.device = spec.device
                 self.dtype = spec.dtype
                 self.load_state = "loaded"
+                self.load_finished_at = time.perf_counter()
+                self.set_load_stage("ready", "Model ready")
                 return graph
             except Exception as exc:
                 self.adapter = None
@@ -93,6 +113,8 @@ class RuntimeState:
                 self.loaded_model_name = None
                 self.load_state = "error"
                 self.load_error = str(exc)
+                self.load_finished_at = time.perf_counter()
+                self.set_load_stage("error", "Model loading failed")
                 raise
 
 
@@ -106,7 +128,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.4.1")
+app = FastAPI(title="Kannaadi API", version="0.5.0")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -115,6 +137,10 @@ app.add_middleware(
     allow_origins=[
         "http://localhost:1420",
         "http://127.0.0.1:1420",
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+        "http://localhost:5173",
+        "http://127.0.0.1:5173",
         "http://tauri.localhost",
         "tauri://localhost",
     ],
@@ -135,11 +161,41 @@ def dependency_available(name: str) -> bool:
     return importlib.util.find_spec(name) is not None
 
 
+_cuda_probe_lock = threading.Lock()
+_cuda_probe_started = False
+_cuda_available = False
+
+
+def _probe_cuda() -> None:
+    global _cuda_available
+    try:
+        import torch
+        _cuda_available = bool(torch.cuda.is_available())
+    except Exception:
+        _cuda_available = False
+
+
 def cuda_available() -> bool:
-    if not dependency_available("torch"):
-        return False
-    import torch
-    return bool(torch.cuda.is_available())
+    """Return a non-blocking CUDA capability snapshot.
+
+    Importing PyTorch can take tens of seconds on Windows. The status endpoint must
+    remain a lightweight liveness call, so the first probe runs in a daemon thread.
+    A model load imports the same module normally and later status calls see the
+    completed result.
+    """
+    global _cuda_probe_started, _cuda_available
+    torch = sys.modules.get("torch")
+    if torch is not None:
+        try:
+            _cuda_available = bool(torch.cuda.is_available())
+        except Exception:
+            pass
+        return _cuda_available
+    with _cuda_probe_lock:
+        if not _cuda_probe_started and dependency_available("torch"):
+            _cuda_probe_started = True
+            threading.Thread(target=_probe_cuda, name="kannaadi-cuda-probe", daemon=True).start()
+    return _cuda_available
 
 
 @app.get("/health")
@@ -150,6 +206,9 @@ def health() -> dict[str, str]:
 @app.get("/api/v1/status")
 def status(request: Request) -> dict[str, object]:
     runtime: RuntimeState = request.app.state.runtime
+    load_elapsed = 0.0
+    if runtime.load_started_at is not None:
+        load_elapsed = (runtime.load_finished_at or time.perf_counter()) - runtime.load_started_at
     return {
         "backend": "ready",
         "torchAvailable": dependency_available("torch"),
@@ -161,6 +220,9 @@ def status(request: Request) -> dict[str, object]:
         "loadedModelName": runtime.loaded_model_name,
         "loadState": runtime.load_state,
         "loadError": runtime.load_error,
+        "loadStage": runtime.load_stage,
+        "loadMessage": runtime.load_message,
+        "loadElapsedSeconds": round(load_elapsed, 2),
         "runCount": len(runtime.experiments.list_runs()) if runtime.experiments else 0,
         "cacheBytes": sum(run.cache_bytes for run in runtime.experiments.list_runs()) if runtime.experiments else 0,
     }
@@ -399,6 +461,38 @@ async def head_sweep(run_id: str, payload: HeadSweepRequest, request: Request) -
             positions=payload.positions,
             metric=payload.metric,
         )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/mlp-sweep",
+    response_model=MlpSweepResult,
+    response_model_by_alias=True,
+)
+async def mlp_sweep(run_id: str, payload: MlpSweepRequest, request: Request) -> MlpSweepResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.mlp_sweep,
+            run_id,
+            kind=payload.kind,
+            token_scope=payload.token_scope,
+            positions=payload.positions,
+            metric=payload.metric,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/direct-attribution",
+    response_model=AttributionResult,
+    response_model_by_alias=True,
+)
+async def direct_attribution(run_id: str, payload: MetricSpec, request: Request) -> AttributionResult:
+    try:
+        return await run_in_threadpool(experiment_engine(request).direct_attribution, run_id, payload)
     except Exception as exc:
         raise run_error(exc) from exc
 

@@ -14,6 +14,8 @@ from kannaadi.domain import (
     AlignmentPair,
     ArchitectureGraph,
     AttentionResult,
+    AttributionEffect,
+    AttributionResult,
     CausalEffect,
     ComponentNode,
     ContrastResult,
@@ -23,6 +25,8 @@ from kannaadi.domain import (
     InterventionSpec,
     MetricResult,
     MetricSpec,
+    MlpEffect,
+    MlpSweepResult,
     PatchMapping,
     Prediction,
     ResidualPoint,
@@ -36,6 +40,8 @@ from kannaadi.domain import (
 
 
 HEAD_ID = re.compile(r"blocks\.(?P<layer>\d+)\.attn\.head\.(?P<head>\d+)$")
+MLP_ID = re.compile(r"blocks\.(?P<layer>\d+)\.mlp$")
+NEURON_ID = re.compile(r"blocks\.(?P<layer>\d+)\.mlp\.neuron\.(?P<neuron>\d+)$")
 
 
 @dataclass(slots=True)
@@ -66,6 +72,7 @@ class ExperimentEngine:
         "hook_resid_mid",
         "hook_resid_post",
         "hook_normalized",
+        "hook_scale",
         "mlp.hook_pre",
         "mlp.hook_post",
     )
@@ -228,7 +235,7 @@ class ExperimentEngine:
         with self._lock:
             baseline = self._artifacts(baseline_run_id)
             resolved_positions = self._resolve_positions(baseline, token_scope, positions or [])
-            grouped = self._group_heads(component_ids)
+            grouped, mlp_layers, grouped_neurons = self._partition_intervenable_components(component_ids)
             hooks: list[tuple[str, Any]] = []
             for layer, heads in grouped.items():
                 selected_heads = tuple(sorted(heads))
@@ -253,6 +260,51 @@ class ExperimentEngine:
                     return updated
 
                 hooks.append((f"blocks.{layer}.attn.hook_result", ablate_selected))
+
+            for layer in sorted(mlp_layers):
+                reference = baseline.cache[f"blocks.{layer}.hook_mlp_out"].float().mean(dim=1)[0]
+
+                def ablate_mlp(
+                    result: Any,
+                    hook: Any,
+                    token_positions: tuple[int, ...] = tuple(resolved_positions),
+                    reference_value: Any = reference,
+                    ablation_kind: str = kind,
+                ) -> Any:
+                    del hook
+                    updated = result.clone()
+                    if ablation_kind == "zero_ablation":
+                        updated[:, list(token_positions), :] = 0
+                    else:
+                        value = reference_value.to(device=updated.device, dtype=updated.dtype)
+                        updated[:, list(token_positions), :] = value
+                    return updated
+
+                hooks.append((f"blocks.{layer}.hook_mlp_out", ablate_mlp))
+
+            for layer, neurons in grouped_neurons.items():
+                selected_neurons = tuple(sorted(neurons))
+                reference = baseline.cache[f"blocks.{layer}.mlp.hook_post"].float().mean(dim=1)[0]
+
+                def ablate_neurons(
+                    result: Any,
+                    hook: Any,
+                    indices: tuple[int, ...] = selected_neurons,
+                    token_positions: tuple[int, ...] = tuple(resolved_positions),
+                    reference_values: Any = reference,
+                    ablation_kind: str = kind,
+                ) -> Any:
+                    del hook
+                    updated = result.clone()
+                    for neuron in indices:
+                        if ablation_kind == "zero_ablation":
+                            updated[:, list(token_positions), neuron] = 0
+                        else:
+                            value = reference_values[neuron].to(device=updated.device, dtype=updated.dtype)
+                            updated[:, list(token_positions), neuron] = value
+                    return updated
+
+                hooks.append((f"blocks.{layer}.mlp.hook_post", ablate_neurons))
 
             intervention = InterventionSpec(
                 kind=kind,
@@ -324,7 +376,7 @@ class ExperimentEngine:
                 if mapping.source_position >= len(source.record.tokens) or mapping.destination_position >= len(destination.record.tokens):
                     raise ValueError("A patch mapping is outside the source or destination token range")
 
-            grouped = self._group_heads(component_ids)
+            grouped, mlp_layers, grouped_neurons = self._partition_intervenable_components(component_ids)
             hooks: list[tuple[str, Any]] = []
             for layer, heads in grouped.items():
                 selected_heads = tuple(sorted(heads))
@@ -349,6 +401,51 @@ class ExperimentEngine:
                     return updated
 
                 hooks.append((f"blocks.{layer}.attn.hook_result", patch_selected))
+
+            for layer in sorted(mlp_layers):
+                source_mlp = source.cache[f"blocks.{layer}.hook_mlp_out"][0]
+
+                def patch_mlp(
+                    result: Any,
+                    hook: Any,
+                    source_values: Any = source_mlp,
+                    token_mappings: tuple[PatchMapping, ...] = tuple(mappings),
+                ) -> Any:
+                    del hook
+                    updated = result.clone()
+                    for mapping in token_mappings:
+                        value = source_values[mapping.source_position].to(
+                            device=updated.device,
+                            dtype=updated.dtype,
+                        )
+                        updated[:, mapping.destination_position, :] = value
+                    return updated
+
+                hooks.append((f"blocks.{layer}.hook_mlp_out", patch_mlp))
+
+            for layer, neurons in grouped_neurons.items():
+                selected_neurons = tuple(sorted(neurons))
+                source_post = source.cache[f"blocks.{layer}.mlp.hook_post"][0]
+
+                def patch_neurons(
+                    result: Any,
+                    hook: Any,
+                    indices: tuple[int, ...] = selected_neurons,
+                    source_values: Any = source_post,
+                    token_mappings: tuple[PatchMapping, ...] = tuple(mappings),
+                ) -> Any:
+                    del hook
+                    updated = result.clone()
+                    for mapping in token_mappings:
+                        for neuron in indices:
+                            value = source_values[mapping.source_position, neuron].to(
+                                device=updated.device,
+                                dtype=updated.dtype,
+                            )
+                            updated[:, mapping.destination_position, neuron] = value
+                    return updated
+
+                hooks.append((f"blocks.{layer}.mlp.hook_post", patch_neurons))
 
             destination_positions = sorted({mapping.destination_position for mapping in mappings})
             intervention = InterventionSpec(
@@ -465,6 +562,196 @@ class ExperimentEngine:
                 effects=effects,
                 minimum=min(deltas, default=0.0),
                 maximum=max(deltas, default=0.0),
+                durationMs=round((time.perf_counter() - started) * 1000, 3),
+            )
+
+    def mlp_sweep(
+        self,
+        run_id: str,
+        *,
+        kind: Literal["zero_ablation", "mean_ablation"],
+        token_scope: Literal["all", "positions"],
+        positions: list[int],
+        metric: MetricSpec,
+    ) -> MlpSweepResult:
+        """Measure every MLP with exact interventions in bounded batched forwards."""
+        import torch
+
+        with self._lock, torch.inference_mode():
+            started = time.perf_counter()
+            baseline = self._artifacts(run_id)
+            baseline_metric = self.metric(run_id, metric)
+            target_id = baseline_metric.target_token_id
+            distractor_id = baseline_metric.distractor_token_id
+            output_position = baseline_metric.position
+            token_positions = self._resolve_positions(baseline, token_scope, positions)
+            device = str(getattr(self.model.cfg, "device", self.model_spec.device))
+            effects: list[MlpEffect] = []
+            layers = list(range(self.architecture.n_layers))
+
+            # Bounding the sweep batch keeps deeper models usable on modest GPUs/CPUs.
+            for start in range(0, len(layers), 16):
+                batch_layers = layers[start : start + 16]
+                tokens = baseline.tokens.to(device).repeat(len(batch_layers), 1)
+                hooks: list[tuple[str, Any]] = []
+                for row, layer in enumerate(batch_layers):
+                    reference = baseline.cache[f"blocks.{layer}.hook_mlp_out"].float().mean(dim=1)[0]
+
+                    def ablate_layer(
+                        result: Any,
+                        hook: Any,
+                        batch_row: int = row,
+                        token_indices: tuple[int, ...] = tuple(token_positions),
+                        reference_value: Any = reference,
+                        ablation_kind: str = kind,
+                    ) -> Any:
+                        del hook
+                        updated = result.clone()
+                        if ablation_kind == "zero_ablation":
+                            updated[batch_row, list(token_indices), :] = 0
+                        else:
+                            value = reference_value.to(device=updated.device, dtype=updated.dtype)
+                            updated[batch_row, list(token_indices), :] = value
+                        return updated
+
+                    hooks.append((f"blocks.{layer}.hook_mlp_out", ablate_layer))
+
+                logits = self.model.run_with_hooks(tokens, fwd_hooks=hooks).detach().to("cpu").float()
+                values = logits[:, output_position, target_id]
+                if distractor_id is not None:
+                    values = values - logits[:, output_position, distractor_id]
+                for layer, value in zip(batch_layers, values.tolist(), strict=True):
+                    effects.append(
+                        MlpEffect(
+                            componentId=f"blocks.{layer}.mlp",
+                            layer=layer,
+                            metricValue=float(value),
+                            delta=float(value - baseline_metric.value),
+                        )
+                    )
+
+            deltas = [effect.delta for effect in effects]
+            return MlpSweepResult(
+                runId=run_id,
+                kind=kind,
+                metric=baseline_metric,
+                effects=effects,
+                minimum=min(deltas, default=0.0),
+                maximum=max(deltas, default=0.0),
+                durationMs=round((time.perf_counter() - started) * 1000, 3),
+            )
+
+    def direct_attribution(self, run_id: str, metric: MetricSpec) -> AttributionResult:
+        """Decompose a logit under the observed final-normalization scale.
+
+        This is the standard direct-logit-attribution view: it is linear and useful
+        for ranking writes to the residual stream, but it is deliberately not
+        described as a causal or path-specific effect.
+        """
+        import torch
+
+        with self._lock, torch.inference_mode():
+            started = time.perf_counter()
+            artifacts = self._artifacts(run_id)
+            metric_result = self.metric(run_id, metric)
+            position = metric_result.position
+            direction = self.model.W_U[:, metric_result.target_token_id].detach().to("cpu").float()
+            if metric_result.distractor_token_id is not None:
+                direction -= self.model.W_U[:, metric_result.distractor_token_id].detach().to("cpu").float()
+
+            final_residual = artifacts.cache[
+                f"blocks.{self.architecture.n_layers - 1}.hook_resid_post"
+            ][0, position].float()
+            normalization = str(getattr(self.model.cfg, "normalization_type", "LN"))
+            centers = normalization.startswith("LN")
+            scale_hook = artifacts.cache.get("ln_final.hook_scale")
+            if scale_hook is not None:
+                scale = float(scale_hook[0, position].float().reshape(-1)[0].item())
+            else:
+                normalized = final_residual - final_residual.mean() if centers else final_residual
+                epsilon = float(getattr(self.model.cfg, "eps", 1e-5))
+                scale = float((normalized.square().mean() + epsilon).sqrt().item())
+            if not torch.isfinite(torch.tensor(scale)) or scale <= 0:
+                raise ValueError("Final-normalization scale is not finite")
+            final_weight = getattr(getattr(self.model, "ln_final", None), "w", None)
+            weight = final_weight.detach().to("cpu").float() if final_weight is not None else None
+
+            def contribution(vector: Any) -> float:
+                value = vector.detach().to("cpu").float()
+                if centers:
+                    value = value - value.mean()
+                value = value / scale
+                if weight is not None:
+                    value = value * weight
+                return float((value * direction).sum().item())
+
+            effects: list[AttributionEffect] = []
+            embed = artifacts.cache.get("hook_embed")
+            if embed is not None:
+                effects.append(
+                    AttributionEffect(
+                        componentId="embed",
+                        label="Token embedding",
+                        kind="embedding",
+                        value=contribution(embed[0, position]),
+                    )
+                )
+            positional = artifacts.cache.get("hook_pos_embed")
+            if positional is not None:
+                effects.append(
+                    AttributionEffect(
+                        componentId="pos_embed",
+                        label="Positional embedding",
+                        kind="embedding",
+                        value=contribution(positional[0, position]),
+                    )
+                )
+            for layer in range(self.architecture.n_layers):
+                results = artifacts.cache[f"blocks.{layer}.attn.hook_result"][0, position]
+                for head in range(self.architecture.n_heads):
+                    effects.append(
+                        AttributionEffect(
+                            componentId=f"blocks.{layer}.attn.head.{head}",
+                            label=f"L{layer}H{head}",
+                            kind="head",
+                            layer=layer,
+                            head=head,
+                            value=contribution(results[head]),
+                        )
+                    )
+                effects.append(
+                    AttributionEffect(
+                        componentId=f"blocks.{layer}.mlp",
+                        label=f"MLP L{layer}",
+                        kind="mlp",
+                        layer=layer,
+                        value=contribution(artifacts.cache[f"blocks.{layer}.hook_mlp_out"][0, position]),
+                    )
+                )
+
+            component_sum = sum(effect.value for effect in effects)
+            remainder = metric_result.value - component_sum
+            denominator = metric_result.value
+            for effect in effects:
+                effect.fraction = effect.value / denominator if abs(denominator) > 1e-8 else None
+            effects.append(
+                AttributionEffect(
+                    componentId="unattributed_remainder",
+                    label="Biases and unattributed remainder",
+                    kind="remainder",
+                    value=remainder,
+                    fraction=remainder / denominator if abs(denominator) > 1e-8 else None,
+                )
+            )
+            values = [effect.value for effect in effects]
+            return AttributionResult(
+                runId=run_id,
+                metric=metric_result,
+                effects=effects,
+                componentSum=component_sum,
+                remainder=remainder,
+                minimum=min(values, default=0.0),
+                maximum=max(values, default=0.0),
                 durationMs=round((time.perf_counter() - started) * 1000, 3),
             )
 
@@ -732,18 +1019,42 @@ class ExperimentEngine:
             raise ValueError("An intervention position is outside the prompt")
         return resolved
 
-    def _group_heads(self, component_ids: list[str]) -> dict[int, set[int]]:
-        grouped: dict[int, set[int]] = {}
+    def _partition_intervenable_components(
+        self, component_ids: list[str]
+    ) -> tuple[dict[int, set[int]], set[int], dict[int, set[int]]]:
+        heads: dict[int, set[int]] = {}
+        mlps: set[int] = set()
+        neurons: dict[int, set[int]] = {}
         for component_id in component_ids:
             match = HEAD_ID.fullmatch(component_id)
-            if not match:
-                raise ValueError(f"Causal head interventions require an attention-head ID, received: {component_id}")
-            layer = int(match.group("layer"))
-            head = int(match.group("head"))
-            if layer >= self.architecture.n_layers or head >= self.architecture.n_heads:
-                raise ValueError(f"Component is outside the loaded architecture: {component_id}")
-            grouped.setdefault(layer, set()).add(head)
-        return grouped
+            if match:
+                layer = int(match.group("layer"))
+                head = int(match.group("head"))
+                if layer >= self.architecture.n_layers or head >= self.architecture.n_heads:
+                    raise ValueError(f"Component is outside the loaded architecture: {component_id}")
+                heads.setdefault(layer, set()).add(head)
+                continue
+            match = MLP_ID.fullmatch(component_id)
+            if match:
+                layer = int(match.group("layer"))
+                if layer >= self.architecture.n_layers:
+                    raise ValueError(f"Component is outside the loaded architecture: {component_id}")
+                mlps.add(layer)
+                continue
+            match = NEURON_ID.fullmatch(component_id)
+            if match:
+                layer = int(match.group("layer"))
+                neuron = int(match.group("neuron"))
+                d_mlp = self.architecture.d_mlp
+                if layer >= self.architecture.n_layers or d_mlp is None or neuron >= d_mlp:
+                    raise ValueError(f"Component is outside the loaded architecture: {component_id}")
+                neurons.setdefault(layer, set()).add(neuron)
+                continue
+            raise ValueError(
+                "Causal interventions support attention-head IDs, whole-MLP IDs, "
+                f"and MLP-neuron IDs; received: {component_id}"
+            )
+        return heads, mlps, neurons
 
     def _decode_token(self, token_id: int) -> str:
         return str(self.model.tokenizer.decode([token_id]))
@@ -755,7 +1066,15 @@ class ExperimentEngine:
     @staticmethod
     def _display_component(component_id: str) -> str:
         match = HEAD_ID.fullmatch(component_id)
-        return f"L{match.group('layer')}H{match.group('head')}" if match else component_id
+        if match:
+            return f"L{match.group('layer')}H{match.group('head')}"
+        match = MLP_ID.fullmatch(component_id)
+        if match:
+            return f"MLP L{match.group('layer')}"
+        match = NEURON_ID.fullmatch(component_id)
+        if match:
+            return f"L{match.group('layer')}N{match.group('neuron')}"
+        return component_id
 
     def _artifacts(self, run_id: str) -> RunArtifacts:
         try:

@@ -50,6 +50,16 @@ impl ManagedSidecar {
     fn stop(&self) {
         if let Ok(mut child_guard) = self.child.lock() {
             if let Some(child) = child_guard.as_mut() {
+                #[cfg(target_os = "windows")]
+                {
+                    let _ = Command::new("taskkill")
+                        .args(["/PID", &child.id().to_string(), "/T", "/F"])
+                        .stdin(Stdio::null())
+                        .stdout(Stdio::null())
+                        .stderr(Stdio::null())
+                        .creation_flags(CREATE_NO_WINDOW)
+                        .status();
+                }
                 let _ = child.kill();
                 let _ = child.wait();
             }
@@ -63,6 +73,20 @@ impl ManagedSidecar {
 
 #[tauri::command]
 fn sidecar_info(state: State<'_, ManagedSidecar>) -> Result<SidecarInfo, String> {
+    state
+        .info
+        .lock()
+        .map(|info| info.clone())
+        .map_err(|_| "Sidecar state is unavailable".into())
+}
+
+#[tauri::command]
+fn restart_sidecar(
+    app: tauri::AppHandle,
+    state: State<'_, ManagedSidecar>,
+) -> Result<SidecarInfo, String> {
+    state.stop();
+    start_sidecar(app)?;
     state
         .info
         .lock()
@@ -283,6 +307,7 @@ pub fn run() {
         .manage(ManagedSidecar::new())
         .invoke_handler(tauri::generate_handler![
             sidecar_info,
+            restart_sidecar,
             save_workspace,
             list_workspaces,
             load_workspace
