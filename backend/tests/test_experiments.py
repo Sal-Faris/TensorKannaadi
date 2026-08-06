@@ -56,3 +56,27 @@ def test_intervention_ids_cover_heads_whole_mlps_and_individual_neurons() -> Non
         engine._partition_intervenable_components(["blocks.1.mlp.neuron.24"])
     with pytest.raises(ValueError, match="support attention-head IDs"):
         engine._partition_intervenable_components(["blocks.0.attn"])
+
+
+def test_dataset_summary_keeps_effect_size_spread_and_direction_auditable() -> None:
+    summary = ExperimentEngine._dataset_summary(4, [-2.0, -1.0, 0.5])
+
+    assert summary.requested_count == 4
+    assert summary.completed_count == 3
+    assert summary.failed_count == 1
+    assert summary.mean_delta == pytest.approx(-5 / 6)
+    assert summary.median_delta == -1.0
+    assert summary.minimum_delta == -2.0
+    assert summary.maximum_delta == 0.5
+    assert summary.mean_absolute_delta == pytest.approx(7 / 6)
+    assert summary.direction_consistency == pytest.approx(2 / 3)
+    assert summary.standard_deviation is not None
+
+
+def test_empty_dataset_summary_reports_missing_statistics_instead_of_inventing_zeroes() -> None:
+    summary = ExperimentEngine._dataset_summary(2, [])
+
+    assert summary.completed_count == 0
+    assert summary.failed_count == 2
+    assert summary.mean_delta is None
+    assert summary.direction_consistency is None

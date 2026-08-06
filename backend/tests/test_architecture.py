@@ -84,3 +84,34 @@ def test_adapter_uses_memory_efficient_loader_for_reduced_precision(
     )
 
     assert calls == [expected_loader]
+
+
+def test_pythia_installs_transformers_five_output_head_compatibility(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeNeoX:
+        def get_output_embeddings(self):
+            return "language-model-head"
+
+    fake_transformers = ModuleType("transformers")
+    fake_transformers.GPTNeoXForCausalLM = FakeNeoX
+    monkeypatch.setitem(sys.modules, "transformers", fake_transformers)
+
+    TransformerLensAdapter._install_transformers_compatibility("EleutherAI/pythia-70m")
+
+    assert FakeNeoX().embed_out == "language-model-head"
+
+
+def test_parallel_blocks_do_not_claim_a_nonexistent_mid_residual_hook() -> None:
+    graph = TransformerLensAdapter.from_dimensions(
+        ModelSpec(id="parallel", display_name="Parallel", backend="transformer_lens"),
+        n_layers=2,
+        n_heads=2,
+        d_model=16,
+        vocabulary_size=100,
+        block_topology="parallel",
+    )
+
+    assert graph.block_topology == "parallel"
+    assert graph.layers[0].residual_mid.id == "blocks.0.parallel_merge"
+    assert graph.layers[0].residual_mid.activation_points == []

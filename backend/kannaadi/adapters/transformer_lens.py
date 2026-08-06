@@ -36,6 +36,7 @@ class TransformerLensAdapter(ModelAdapter):
             raise ValueError(f"Unsupported dtype: {spec.dtype}")
         model_name = spec.local_path or spec.repository or spec.id
         report("resolving_model", f"Resolving {model_name}")
+        self._install_transformers_compatibility(model_name)
         load_kwargs: dict[str, Any] = {"device": spec.device, "dtype": dtype}
         if spec.revision:
             load_kwargs["revision"] = spec.revision
@@ -67,6 +68,29 @@ class TransformerLensAdapter(ModelAdapter):
         report("configuring_hooks", "Enabling per-head result hooks")
         self._model.set_use_attn_result(True)
         self._spec = spec
+
+    @staticmethod
+    def _install_transformers_compatibility(model_name: str) -> None:
+        """Bridge narrowly-scoped upstream API renames used by TransformerLens.
+
+        Transformers 5 exposes the GPT-NeoX language-model head through
+        ``get_output_embeddings`` while TransformerLens 3.6 still reads the
+        historical ``embed_out`` attribute during Pythia weight conversion.
+        Keep the compatibility boundary here rather than leaking it into the
+        experiment engine or asking researchers to downgrade their environment.
+        """
+
+        lowered = model_name.lower()
+        if "pythia" not in lowered and "neox" not in lowered and "gpt-neox" not in lowered:
+            return
+        try:
+            from transformers import GPTNeoXForCausalLM
+        except ImportError:
+            return
+        if not hasattr(GPTNeoXForCausalLM, "embed_out"):
+            GPTNeoXForCausalLM.embed_out = property(  # type: ignore[attr-defined]
+                lambda model: model.get_output_embeddings()
+            )
 
     def architecture(self) -> ArchitectureGraph:
         if self._model is None or self._spec is None:
@@ -139,7 +163,24 @@ class TransformerLensAdapter(ModelAdapter):
                 )
                 for head in range(n_heads)
             ]
-            residual_mid = ComponentNode(id=f"blocks.{layer}.resid_mid", label="Residual mid", kind="residual", layer=layer, activationPoints=[f"blocks.{layer}.hook_resid_mid"])
+            residual_mid = (
+                ComponentNode(
+                    id=f"blocks.{layer}.parallel_merge",
+                    label="Parallel branch merge",
+                    kind="operation",
+                    layer=layer,
+                    activationPoints=[],
+                    metadata={"topology": "parallel", "synthetic": False},
+                )
+                if block_topology == "parallel"
+                else ComponentNode(
+                    id=f"blocks.{layer}.resid_mid",
+                    label="Residual mid",
+                    kind="residual",
+                    layer=layer,
+                    activationPoints=[f"blocks.{layer}.hook_resid_mid"],
+                )
+            )
             norm2 = ComponentNode(
                 id=f"blocks.{layer}.ln2", label=norm_type, kind="normalization", layer=layer,
                 activationPoints=[f"blocks.{layer}.ln2.hook_normalized"],

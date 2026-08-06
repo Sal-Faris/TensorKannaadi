@@ -9,6 +9,9 @@ from kannaadi.domain import (
     AttributionEffect,
     AttributionResult,
     ContrastResult,
+    DatasetAblationResult,
+    DatasetAblationRow,
+    DatasetAblationSummary,
     InterventionResult,
     MetricResult,
     ModelSpec,
@@ -142,6 +145,44 @@ class ExperimentStub:
             minimum=.5,
             maximum=2.0,
             durationMs=12,
+        )
+
+    def dataset_ablation(self, run_ids, component_ids, **kwargs):
+        assert run_ids == ["run_test"]
+        assert component_ids == ["blocks.1.attn.head.2"]
+        assert kwargs["kind"] == "zero_ablation"
+        assert kwargs["metric"].target_token == " Paris"
+        return DatasetAblationResult(
+            id="dataset_test",
+            kind="zero_ablation",
+            componentIds=component_ids,
+            tokenScope="all",
+            positions=[],
+            metric=kwargs["metric"],
+            rows=[DatasetAblationRow(
+                baselineRunId="run_test",
+                intervenedRunId="run_ablation",
+                intervenedRun=run_record("intervened", "run_test"),
+                label="Clean run",
+                prompt="The capital of France is",
+                status="complete",
+                baselineValue=2.5,
+                intervenedValue=1.75,
+                delta=-.75,
+            )],
+            summary=DatasetAblationSummary(
+                requestedCount=1,
+                completedCount=1,
+                failedCount=0,
+                meanDelta=-.75,
+                medianDelta=-.75,
+                standardDeviation=0,
+                minimumDelta=-.75,
+                maximumDelta=-.75,
+                meanAbsoluteDelta=.75,
+                directionConsistency=1,
+            ),
+            durationMs=20,
         )
 
 
@@ -311,3 +352,27 @@ def test_mlp_sweep_and_direct_attribution_are_first_class_api_workflows() -> Non
     assert attribution.status_code == 200
     assert attribution.json()["method"] == "direct_logit_attribution_fixed_final_norm"
     assert attribution.json()["componentSum"] + attribution.json()["remainder"] == pytest.approx(2.5)
+
+
+def test_dataset_ablation_returns_per_prompt_evidence_and_aggregate_statistics() -> None:
+    app.state.runtime.adapter = LoadedAdapter()
+    app.state.runtime.experiments = ExperimentStub()
+
+    response = client.post(
+        "/api/v1/experiments/dataset-ablation",
+        json={
+            "runIds": ["run_test"],
+            "kind": "zero_ablation",
+            "componentIds": ["blocks.1.attn.head.2"],
+            "tokenScope": "all",
+            "positions": [],
+            "metric": {"targetToken": " Paris", "distractorToken": " Berlin", "position": -1},
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.json()["rows"][0]["intervenedRunId"] == "run_ablation"
+    assert response.json()["rows"][0]["intervenedRun"]["kind"] == "intervened"
+    assert response.json()["rows"][0]["delta"] == -.75
+    assert response.json()["summary"]["directionConsistency"] == 1
+    assert "selected prompt set" in response.json()["caveat"]

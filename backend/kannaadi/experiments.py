@@ -4,6 +4,7 @@ from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 import re
+import statistics
 import threading
 import time
 from typing import Any, Iterable, Literal
@@ -19,6 +20,9 @@ from kannaadi.domain import (
     CausalEffect,
     ComponentNode,
     ContrastResult,
+    DatasetAblationResult,
+    DatasetAblationRow,
+    DatasetAblationSummary,
     HeadEffect,
     HeadSweepResult,
     InterventionResult,
@@ -347,6 +351,127 @@ class ExperimentEngine:
             positions=positions,
             top_k=top_k,
         ).run
+
+    def dataset_ablation(
+        self,
+        run_ids: list[str],
+        component_ids: list[str],
+        *,
+        kind: Literal["zero_ablation", "mean_ablation"] = "zero_ablation",
+        token_scope: Literal["all", "positions"] = "all",
+        positions: list[int] | None = None,
+        metric: MetricSpec,
+    ) -> DatasetAblationResult:
+        """Apply one intervention recipe across cached baselines and aggregate exact effects.
+
+        Failures are retained per prompt so a long collection does not discard successful
+        work. Shared component IDs are validated before execution; every successful row
+        still points to the immutable baseline and intervention manifests used to measure it.
+        """
+
+        with self._lock:
+            if not run_ids:
+                raise ValueError("Choose at least one baseline run for a dataset experiment")
+            if len(set(run_ids)) != len(run_ids):
+                raise ValueError("Dataset experiments require unique baseline run IDs")
+            self._partition_intervenable_components(component_ids)
+            baselines = [self._artifacts(run_id) for run_id in run_ids]
+            for baseline in baselines:
+                if baseline.record.kind not in {"clean", "corrupted"}:
+                    raise ValueError(
+                        f"Dataset baseline {baseline.record.id} is {baseline.record.kind}; "
+                        "choose original clean or corrupted runs instead of derived interventions"
+                    )
+
+            started = time.perf_counter()
+            rows: list[DatasetAblationRow] = []
+            deltas: list[float] = []
+            for baseline in baselines:
+                try:
+                    result = self.ablate(
+                        baseline.record.id,
+                        component_ids,
+                        kind=kind,
+                        token_scope=token_scope,
+                        positions=positions or [],
+                        metric=metric,
+                    )
+                    if result.effect is None:  # pragma: no cover - guarded by metric above
+                        raise RuntimeError("The intervention completed without its requested metric")
+                    delta = float(result.effect.delta)
+                    deltas.append(delta)
+                    rows.append(
+                        DatasetAblationRow(
+                            baselineRunId=baseline.record.id,
+                            intervenedRunId=result.run.id,
+                            intervenedRun=result.run,
+                            label=baseline.record.label,
+                            prompt=baseline.record.prompt,
+                            status="complete",
+                            baselineValue=result.effect.baseline.value,
+                            intervenedValue=result.effect.intervened.value,
+                            delta=delta,
+                        )
+                    )
+                except Exception as exc:
+                    rows.append(
+                        DatasetAblationRow(
+                            baselineRunId=baseline.record.id,
+                            label=baseline.record.label,
+                            prompt=baseline.record.prompt,
+                            status="error",
+                            error=str(exc),
+                        )
+                    )
+
+            summary = self._dataset_summary(len(run_ids), deltas)
+            return DatasetAblationResult(
+                id=f"dataset_{uuid4().hex[:12]}",
+                kind=kind,
+                componentIds=component_ids,
+                tokenScope=token_scope,
+                positions=[] if token_scope == "all" else list(positions or []),
+                metric=metric,
+                rows=rows,
+                summary=summary,
+                durationMs=round((time.perf_counter() - started) * 1000, 3),
+            )
+
+    @staticmethod
+    def _dataset_summary(requested_count: int, deltas: list[float]) -> DatasetAblationSummary:
+        completed = len(deltas)
+        if not deltas:
+            return DatasetAblationSummary(
+                requestedCount=requested_count,
+                completedCount=0,
+                failedCount=requested_count,
+                meanDelta=None,
+                medianDelta=None,
+                standardDeviation=None,
+                minimumDelta=None,
+                maximumDelta=None,
+                meanAbsoluteDelta=None,
+                directionConsistency=None,
+            )
+        mean_delta = statistics.fmean(deltas)
+        if mean_delta > 0:
+            direction_consistency = sum(delta > 0 for delta in deltas) / completed
+        elif mean_delta < 0:
+            direction_consistency = sum(delta < 0 for delta in deltas) / completed
+        else:
+            direction_consistency = sum(delta == 0 for delta in deltas) / completed
+        return DatasetAblationSummary(
+            requestedCount=requested_count,
+            completedCount=completed,
+            failedCount=requested_count - completed,
+            meanDelta=mean_delta,
+            medianDelta=statistics.median(deltas),
+            standardDeviation=statistics.pstdev(deltas),
+            minimumDelta=min(deltas),
+            maximumDelta=max(deltas),
+            meanAbsoluteDelta=statistics.fmean(abs(delta) for delta in deltas),
+            directionConsistency=direction_consistency,
+        )
 
     def patch(
         self,
@@ -827,19 +952,46 @@ class ExperimentEngine:
         with torch.inference_mode():
             for layer in range(self.architecture.n_layers):
                 for stage in ("pre", "mid", "post"):
-                    resid = artifacts.cache[f"blocks.{layer}.hook_resid_{stage}"][0, resolved_position].float()
+                    hook_name = f"blocks.{layer}.hook_resid_{stage}"
+                    if hook_name not in artifacts.cache:
+                        # Parallel attention/MLP blocks have no real mid-residual
+                        # activation.  Omitting it preserves the model's actual
+                        # computational graph instead of inventing a serial state.
+                        continue
+                    resid = artifacts.cache[hook_name][0, resolved_position].float()
                     point_specs.append((layer, stage, resid))
             stacked = torch.stack([spec[2] for spec in point_specs]).to(device)[:, None, :]
-            target_logits = self.model.unembed(self.model.ln_final(stacked))[:, 0, target_token_id].to("cpu")
-        points = [
-            ResidualPoint(
-                layer=layer,
-                stage=stage,
-                norm=float(resid.norm().item()),
-                targetLogit=float(target_logits[index].item()),
+            lens_logits = self.model.unembed(self.model.ln_final(stacked))[:, 0].to("cpu").float()
+            lens_probabilities = lens_logits.softmax(dim=-1)
+            target_logits = lens_logits[:, target_token_id]
+            entropies = -(lens_probabilities * lens_probabilities.clamp_min(1e-12).log()).sum(dim=-1)
+            top_probabilities, top_ids = lens_probabilities.topk(min(5, lens_probabilities.shape[-1]), dim=-1)
+        points = []
+        for index, (layer, stage, resid) in enumerate(point_specs):
+            predictions = []
+            for probability, token_id in zip(
+                top_probabilities[index].tolist(), top_ids[index].tolist(), strict=True
+            ):
+                text = self._decode_token(int(token_id))
+                predictions.append(
+                    Prediction(
+                        tokenId=int(token_id),
+                        text=text,
+                        display=self._display_token(text),
+                        logit=float(lens_logits[index, token_id].item()),
+                        probability=float(probability),
+                    )
+                )
+            points.append(
+                ResidualPoint(
+                    layer=layer,
+                    stage=stage,
+                    norm=float(resid.norm().item()),
+                    targetLogit=float(target_logits[index].item()),
+                    entropy=float(entropies[index].item()),
+                    topPredictions=predictions,
+                )
             )
-            for index, (layer, stage, resid) in enumerate(point_specs)
-        ]
         return ResidualStreamResult(
             runId=run_id,
             position=resolved_position,
@@ -927,7 +1079,11 @@ class ExperimentEngine:
         cpu_logits = logits.detach().to("cpu")
         cache_bytes = sum(int(value.nelement() * value.element_size()) for value in cache_dict.values())
         run_id = f"run_{uuid4().hex[:12]}"
-        token_strings = [str(token) for token in self.model.to_str_tokens(cpu_tokens[0])]
+        # Decode the exact token tensor used for this run.  TransformerLens'
+        # ``to_str_tokens`` may apply its model-specific default BOS policy a
+        # second time (notably for Pythia), which can produce one more display
+        # token than there are activation positions.
+        token_strings = [self._decode_token(int(token_id)) for token_id in cpu_tokens[0].tolist()]
         record = RunRecord(
             id=run_id,
             kind=kind,

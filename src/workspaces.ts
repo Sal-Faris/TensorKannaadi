@@ -11,7 +11,7 @@ function isTauri(): boolean {
 function validateSnapshot(value: unknown): WorkspaceSnapshot {
   if (!value || typeof value !== "object") throw new Error("Workspace data is not an object");
   const snapshot = value as Partial<WorkspaceSnapshot>;
-  if (snapshot.format !== "kannaadi-workspace" || snapshot.version !== 1 || typeof snapshot.name !== "string") {
+  if (snapshot.format !== "kannaadi-workspace" || ![1, 2, 3].includes(snapshot.version ?? 0) || typeof snapshot.name !== "string") {
     throw new Error("This is not a supported Kannaadi workspace snapshot");
   }
   return snapshot as WorkspaceSnapshot;

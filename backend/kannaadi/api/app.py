@@ -24,6 +24,8 @@ from kannaadi.domain import (
     AttributionResult,
     ContrastRequest,
     ContrastResult,
+    DatasetAblationRequest,
+    DatasetAblationResult,
     HeadSweepRequest,
     HeadSweepResult,
     InterventionResult,
@@ -128,7 +130,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.5.0")
+app = FastAPI(title="Kannaadi API", version="0.6.0")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -391,6 +393,27 @@ async def ablate(run_id: str, payload: AblationRequest, request: Request) -> Int
         return await run_in_threadpool(
             engine.ablate,
             run_id,
+            payload.component_ids,
+            kind=payload.kind,
+            token_scope=payload.token_scope,
+            positions=payload.positions,
+            metric=payload.metric,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/experiments/dataset-ablation",
+    response_model=DatasetAblationResult,
+    response_model_by_alias=True,
+)
+async def dataset_ablation(payload: DatasetAblationRequest, request: Request) -> DatasetAblationResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.dataset_ablation,
+            payload.run_ids,
             payload.component_ids,
             kind=payload.kind,
             token_scope=payload.token_scope,

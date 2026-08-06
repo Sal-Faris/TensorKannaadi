@@ -64,6 +64,13 @@ def main() -> None:
         metric=metric,
     )
     attribution = engine.direct_attribution(clean.id, metric)
+    residual = engine.residual_stream(clean.id)
+    dataset = engine.dataset_ablation(
+        [clean.id, contrast.clean_run.id],
+        ["blocks.5.mlp"],
+        kind="zero_ablation",
+        metric=metric,
+    )
 
     assert mlp.effect is not None and neuron.effect is not None and patch.effect is not None
     assert len(sweep.effects) == architecture.n_layers
@@ -75,11 +82,19 @@ def main() -> None:
     assert abs(
         attribution.component_sum + attribution.remainder - attribution.metric.value
     ) < 1e-6
+    expected_residual_points = architecture.n_layers * (2 if architecture.block_topology == "parallel" else 3)
+    assert len(residual.points) == expected_residual_points
+    assert all(point.top_predictions for point in residual.points)
+    assert all(point.entropy >= 0 for point in residual.points)
+    assert dataset.summary.completed_count == 2
+    assert dataset.summary.failed_count == 0
+    assert all(row.intervened_run is not None for row in dataset.rows)
 
     print(json.dumps({
         "model": architecture.model_id,
         "layers": architecture.n_layers,
         "heads": architecture.n_heads,
+        "blockTopology": architecture.block_topology,
         "cleanRun": clean.id,
         "mlpAblationDelta": mlp.effect.delta,
         "neuronAblationDelta": neuron.effect.delta,
@@ -88,6 +103,8 @@ def main() -> None:
         "attributionEffects": len(attribution.effects),
         "attributionMetric": attribution.metric.value,
         "attributionReconciled": attribution.component_sum + attribution.remainder,
+        "residualReadoutPoints": len(residual.points),
+        "datasetMeanDelta": dataset.summary.mean_delta,
     }, indent=2))
 
 

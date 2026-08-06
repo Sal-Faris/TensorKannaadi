@@ -82,6 +82,13 @@ function mockResearchBackend() {
     if (url.endsWith("/zero-ablate")) body = runRecord("intervened");
     if (url.endsWith("/ablate")) body = { run: runRecord("intervened"), effect: null };
     if (url.includes("/compare/")) body = { baselineRunId: "run_clean", intervenedRunId: "run_ablation", baselineTopToken: " Paris", baselineTopTokenDelta: -1.1, klDivergence: .02, tokens: [{ tokenId: 6342, text: " Paris", display: "·Paris", baselineLogit: 8.2, intervenedLogit: 7.1, deltaLogit: -1.1, baselineProbability: .38, intervenedProbability: .24, deltaProbability: -.14 }] };
+    if (url.includes("/residual-stream")) body = {
+      runId: "run_clean", position: 0, targetTokenId: 6342, targetToken: " Paris",
+      points: Array.from({ length: 6 }, (_, layer) => ["pre", "mid", "post"].map((stage, stageIndex) => ({
+        layer, stage, norm: 10 + layer, targetLogit: layer + stageIndex / 3, entropy: 5 - layer / 10,
+        topPredictions: [{ tokenId: 6342, text: " Paris", display: "·Paris", logit: layer, probability: .38 }],
+      }))).flat(),
+    };
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   });
 }
@@ -210,6 +217,100 @@ test("saves a durable browser workspace snapshot", async () => {
   await user.type(screen.getByRole("textbox", { name: "Name" }), "Geography facts");
   await user.click(screen.getByRole("button", { name: "Save workspace" }));
 
-  expect(await screen.findByRole("button", { name: "Geography facts" })).toBeInTheDocument();
+  const workspace = await screen.findByRole("button", { name: "Geography facts" });
+  expect(workspace).toBeInTheDocument();
   expect(localStorage.getItem("kannaadi.workspaces")).toContain("Geography facts");
+  await user.click(workspace);
+  expect(await screen.findByText(/Workspace “Geography facts” restored/)).toBeInTheDocument();
+});
+
+test("zooms the architecture canvas on a trackpad pinch wheel gesture", async () => {
+  mockConnectedBackend();
+  const { container } = render(<App />);
+  await screen.findByRole("button", { name: "Select L5H3" });
+  const viewport = container.querySelector(".canvas-viewport")!;
+  fireEvent.wheel(viewport, { ctrlKey: true, deltaY: -20, deltaMode: 0, clientX: 400, clientY: 240 });
+  await waitFor(() => expect(Number((screen.getByRole("slider", { name: "Zoom" }) as HTMLInputElement).value)).toBeGreaterThan(100));
+});
+
+test("manages prompt libraries and persistent dark mode", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Manage prompts and collections" }));
+  expect(screen.getByRole("heading", { name: "Prompt library" })).toBeInTheDocument();
+  await user.type(screen.getByRole("textbox", { name: "Name" }), "Induction example");
+  await user.type(screen.getByRole("textbox", { name: "Prompt text" }), "A B A B A");
+  await user.click(screen.getByRole("button", { name: "Add prompt" }));
+  expect(screen.getAllByText("Induction example").length).toBeGreaterThan(0);
+  await user.click(screen.getByRole("button", { name: "Done" }));
+
+  await user.click(screen.getByRole("button", { name: "Switch to dark mode" }));
+  expect(document.documentElement.dataset.theme).toBe("dark");
+  expect(localStorage.getItem("kannaadi.theme")).toBe("dark");
+});
+
+test("compares experiment runs and exposes highlighted reproducible code", async () => {
+  mockResearchBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Contrast" }));
+  await user.click(screen.getByRole("button", { name: "Run contrast" }));
+  await user.click(await screen.findByRole("button", { name: "Experiments" }));
+  expect(screen.getByText("Experiment runs")).toBeInTheDocument();
+  expect(screen.getByText("Compare saved output summaries")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Code" }));
+  expect(document.querySelector(".py-keyword")).toHaveTextContent("from");
+});
+
+test("opens a position-aware residual vocabulary readout from the canvas", async () => {
+  mockResearchBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Run" }));
+  await user.click(screen.getByTitle("blocks.5.resid_pre"));
+  expect(await screen.findByText("Residual vocabulary readout")).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Residual readout position" })).toBeInTheDocument();
+  expect(screen.getByText("Top decoded tokens")).toBeInTheDocument();
+});
+
+test("restores auditable dataset effects for a frozen prompt-batch series", async () => {
+  const baseline = runRecord("clean");
+  const intervened = runRecord("intervened");
+  localStorage.setItem("kannaadi.experimentSeries", JSON.stringify([{ id: "series_geo", collectionId: "collection_geo", collectionName: "Geography facts", runIds: [baseline.id], createdAt: new Date().toISOString() }]));
+  localStorage.setItem("kannaadi.interventionRecipes", JSON.stringify([{ id: "recipe_head", name: "Ablate recall head", kind: "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all", positions: [], targetToken: " Paris", distractorToken: " Berlin", createdAt: new Date().toISOString() }]));
+  localStorage.setItem("kannaadi.datasetAblations", JSON.stringify([{
+    id: "dataset_geo", seriesId: "series_geo", seriesName: "Geography facts", recipeId: "recipe_head", recipeName: "Ablate recall head", kind: "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all", positions: [], metric: { targetToken: " Paris", distractorToken: " Berlin", position: -1 },
+    rows: [{ baselineRunId: baseline.id, intervenedRunId: intervened.id, intervenedRun: intervened, label: "France", prompt: baseline.prompt, status: "complete", baselineValue: 2.5, intervenedValue: 1.75, delta: -.75, error: null }],
+    summary: { requestedCount: 1, completedCount: 1, failedCount: 0, meanDelta: -.75, medianDelta: -.75, standardDeviation: 0, minimumDelta: -.75, maximumDelta: -.75, meanAbsoluteDelta: .75, directionConsistency: 1 }, durationMs: 20, caveat: "Each row is an exact intervention on one cached prompt run. The aggregate describes this selected prompt set and is not a population-level causal estimate.",
+  }]));
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Experiments" }));
+  expect(screen.getByText("Dataset effects")).toBeInTheDocument();
+  expect(screen.getAllByText("Ablate recall head").length).toBeGreaterThan(0);
+  expect(screen.getByText("Direction consistency")).toBeInTheDocument();
+  expect(screen.getByText("100.0%")).toBeInTheDocument();
+});
+
+test("keeps generated code separate from a persistent non-executing scratchpad", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Code" }));
+  expect(document.querySelector(".py-keyword")).toHaveTextContent("from");
+  await user.click(screen.getByRole("button", { name: /Scratchpad/ }));
+  const editor = screen.getByRole("textbox", { name: "Python research scratchpad" });
+  await user.type(editor, "# custom research\nprint('ready')");
+
+  expect(editor).toHaveValue("# custom research\nprint('ready')");
+  expect(localStorage.getItem("kannaadi.codeScratchpads")).toContain("custom research");
+  expect(screen.getByText(/Code execution is intentionally disabled/)).toBeInTheDocument();
 });
