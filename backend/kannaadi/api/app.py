@@ -66,6 +66,7 @@ class RuntimeState:
         self.loaded_model_id: str | None = None
         self.loaded_model_name: str | None = None
         self.device = "cpu"
+        self.dtype: str | None = None
         self.load_state: Literal["idle", "loading", "loaded", "error"] = "idle"
         self.load_error: str | None = None
 
@@ -82,6 +83,7 @@ class RuntimeState:
                 self.loaded_model_id = spec.id
                 self.loaded_model_name = spec.display_name
                 self.device = spec.device
+                self.dtype = spec.dtype
                 self.load_state = "loaded"
                 return graph
             except Exception as exc:
@@ -104,7 +106,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.4.0")
+app = FastAPI(title="Kannaadi API", version="0.4.1")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -154,6 +156,7 @@ def status(request: Request) -> dict[str, object]:
         "transformerLensAvailable": dependency_available("transformer_lens"),
         "cudaAvailable": cuda_available(),
         "device": runtime.device,
+        "dtype": runtime.dtype,
         "loadedModelId": runtime.loaded_model_id,
         "loadedModelName": runtime.loaded_model_name,
         "loadState": runtime.load_state,
@@ -220,7 +223,9 @@ async def load_model(model_id: str, payload: LoadModelRequest, request: Request)
     source: ModelSpec = item["spec"]
     spec = source.model_copy(update={
         "device": payload.device,
-        "dtype": payload.dtype or ("float16" if payload.device == "cuda" else "float32"),
+        # bfloat16 halves resident and peak model memory while remaining robust on
+        # CPU. Callers can still request float32 explicitly when needed.
+        "dtype": payload.dtype or ("float16" if payload.device == "cuda" else "bfloat16"),
     })
     runtime: RuntimeState = request.app.state.runtime
     try:

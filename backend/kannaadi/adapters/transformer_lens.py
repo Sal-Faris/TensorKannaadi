@@ -36,7 +36,29 @@ class TransformerLensAdapter(ModelAdapter):
         load_kwargs: dict[str, Any] = {"device": spec.device, "dtype": dtype}
         if spec.revision:
             load_kwargs["revision"] = spec.revision
-        self._model = HookedTransformer.from_pretrained(model_name, **load_kwargs)
+        # TransformerLens' interpretability-oriented weight processing temporarily
+        # duplicates several tensors. That peak can terminate the Python process on
+        # low-memory CPU machines. Reduced-precision models keep their original
+        # computation and use the documented no-processing path to avoid those copies.
+        reduced_precision = dtype not in {torch.float32, torch.float64}
+        loader = (
+            HookedTransformer.from_pretrained
+            if not reduced_precision
+            else HookedTransformer.from_pretrained_no_processing
+        )
+        self._model = loader(model_name, **load_kwargs)
+        # Centering the unembedding chooses TransformerLens' standard logit gauge.
+        # Do it in place so bfloat16 target-logit effects retain useful resolution
+        # without allocating another vocabulary-sized tensor. Soft-capped logits
+        # are intentionally excluded because translation invariance does not hold.
+        if (
+            reduced_precision
+            and hasattr(self._model, "W_U")
+            and not getattr(getattr(self._model, "cfg", None), "output_logits_soft_cap", None)
+        ):
+            with torch.no_grad():
+                unembed_mean = self._model.W_U.mean(dim=-1, keepdim=True, dtype=torch.float32)
+                self._model.W_U.sub_(unembed_mean.to(self._model.W_U.dtype))
         self._model.set_use_attn_result(True)
         self._spec = spec
 

@@ -109,6 +109,30 @@ test("does not substitute demo architecture when the backend is unavailable", as
   expect(screen.getByText("connection refused")).toBeInTheDocument();
 });
 
+test("reports a model-load failure without mislabeling the healthy desktop service", async () => {
+  vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
+    const url = String(input);
+    if (url.endsWith("/api/v1/models/gpt2-small/load")) {
+      return new Response(JSON.stringify({ detail: "Model loading failed: insufficient memory" }), {
+        status: 500,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    let body: unknown = { status: "ok" };
+    if (url.endsWith("/api/v1/models")) body = [{ id: "gpt2-small", displayName: "GPT-2 Small", repository: "gpt2-small", architectureFamily: "decoder-only", parameterCount: "124M" }];
+    if (url.endsWith("/api/v1/status")) body = { backend: "ready", torchAvailable: true, transformerLensAvailable: true, cudaAvailable: false, device: "cpu", dtype: null, loadedModelId: null, loadedModelName: null, loadState: "idle", loadError: null, runCount: 0, cacheBytes: 0 };
+    return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
+  });
+
+  const user = userEvent.setup();
+  render(<App />);
+  await user.click(await screen.findByRole("button", { name: "Load model" }));
+
+  expect(await screen.findByText("Model could not be loaded")).toBeInTheDocument();
+  expect(screen.queryByText("Desktop service is not connected")).not.toBeInTheDocument();
+  expect(screen.getByText("Model loading failed: insufficient memory")).toBeInTheDocument();
+});
+
 test("runs a real-workflow manifest and compares an exact head ablation", async () => {
   mockResearchBackend();
   const user = userEvent.setup();
