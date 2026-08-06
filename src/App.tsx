@@ -13,24 +13,23 @@ import {
   EllipsisVertical,
   Eye,
   FileJson,
+  FlaskConical,
+  FolderOpen,
   Hand,
   History,
   Info,
   Layers3,
   Maximize2,
   MousePointer2,
-  PanelLeftClose,
   Play,
   Plus,
   Redo2,
   RotateCcw,
   Save,
   Scan,
-  Settings2,
   SlidersHorizontal,
   Sparkles,
   SquareDashedMousePointer,
-  Tag,
   Undo2,
   X,
   ZoomIn,
@@ -51,17 +50,24 @@ import type {
   ActivationSeries,
   ArchitectureGraph,
   AttentionResult,
+  CausalEffect,
   ComponentNode,
+  ComponentGroup,
+  ContrastResult,
+  HeadSweepResult,
   LayerNode,
+  MetricSpec,
   ModelCatalogEntry,
   ResidualStreamResult,
   RunComparison,
   RunRecord,
   RuntimeStatus,
+  WorkspaceSnapshot,
 } from "./types";
+import { listWorkspaces, loadWorkspace, saveWorkspace } from "./workspaces";
 
 type Tool = "pointer" | "box" | "pan";
-type PanelTab = "Tokens" | "Attention" | "QK / OV" | "Logits" | "Activations" | "Residual Stream" | "Code";
+type PanelTab = "Tokens" | "Alignment" | "Attention" | "QK / OV" | "Logits" | "Activations" | "Residual Stream" | "Causal Sweep" | "Code";
 
 const DEFAULT_MODEL: ModelCatalogEntry = {
   id: "gpt2-small",
@@ -78,11 +84,17 @@ export function App() {
   const [models, setModels] = useState<ModelCatalogEntry[]>([DEFAULT_MODEL]);
   const [modelId, setModelId] = useState("gpt2-small");
   const [prompt, setPrompt] = usePersistentText("kannaadi.prompt", "The capital of France is");
+  const [corruptedPrompt, setCorruptedPrompt] = usePersistentText("kannaadi.corruptedPrompt", "The capital of Germany is");
+  const [targetToken, setTargetToken] = usePersistentText("kannaadi.targetToken", " Paris");
+  const [distractorToken, setDistractorToken] = usePersistentText("kannaadi.distractorToken", " Berlin");
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [contrast, setContrast] = useState<ContrastResult | null>(null);
+  const [effects, setEffects] = useState<Record<string, CausalEffect>>({});
   const [loading, setLoading] = useState(false);
   const [running, setRunning] = useState(false);
   const [modelDialog, setModelDialog] = useState(false);
+  const [experimentDialog, setExperimentDialog] = useState(false);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const activeRun = runs.find((run) => run.id === activeRunId) ?? null;
@@ -131,6 +143,8 @@ export function App() {
       setArchitecture(graph);
       setRuns([]);
       setActiveRunId(null);
+      setContrast(null);
+      setEffects({});
       setRuntime(await api.status());
     } catch (error) {
       const message = error instanceof Error ? error.message : "Model loading failed";
@@ -161,15 +175,74 @@ export function App() {
     }
   };
 
-  const zeroAblate = async (componentIds: string[]) => {
-    const baselineId = activeRun?.kind === "intervened" ? activeRun.parentRunId : activeRun?.id;
-    if (!baselineId) throw new Error("Run a clean prompt before adding an intervention");
+  const metricSpec = (): MetricSpec | undefined => targetToken ? {
+    targetToken,
+    distractorToken: distractorToken || undefined,
+    position: -1,
+  } : undefined;
+
+  const runContrast = async () => {
+    if (!architecture) {
+      await loadModel();
+      return;
+    }
+    if (!prompt.trim() || !corruptedPrompt.trim()) return;
+    setRunning(true);
+    setConnectionError(null);
+    try {
+      const result = await api.contrast(prompt, corruptedPrompt);
+      setContrast(result);
+      setRuns((current) => [result.corruptedRun, result.cleanRun, ...current]);
+      setActiveRunId(result.corruptedRun.id);
+      updateRuntimeForRun(result.cleanRun);
+      updateRuntimeForRun(result.corruptedRun);
+      setExperimentDialog(false);
+    } catch (error) {
+      setConnectionError(error instanceof Error ? error.message : "Contrast execution failed");
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const causalAblate = async (
+    componentIds: string[],
+    kind: "zero_ablation" | "mean_ablation",
+    positions: number[] | null,
+  ) => {
+    const baselineId = activeRun?.kind === "intervened" || activeRun?.kind === "patched" ? activeRun.parentRunId : activeRun?.id;
+    if (!baselineId) throw new Error("Run a prompt before adding an intervention");
     setRunning(true);
     try {
-      const run = await api.zeroAblate(baselineId, componentIds);
-      setRuns((current) => [run, ...current]);
-      setActiveRunId(run.id);
-      updateRuntimeForRun(run);
+      const result = await api.ablate(baselineId, componentIds, kind, positions, metricSpec());
+      setRuns((current) => [result.run, ...current]);
+      setActiveRunId(result.run.id);
+      if (result.effect) setEffects((current) => ({ ...current, [result.run.id]: result.effect! }));
+      updateRuntimeForRun(result.run);
+    } finally {
+      setRunning(false);
+    }
+  };
+
+  const patchActivations = async (componentIds: string[], positions: number[] | null) => {
+    if (!contrast) throw new Error("Run a clean/corrupted contrast before activation patching");
+    const mappings = contrast.alignment.pairs
+      .filter((pair) => pair.sourcePosition !== null && pair.destinationPosition !== null)
+      .filter((pair) => !positions || positions.includes(pair.destinationPosition!))
+      .map((pair) => ({ sourcePosition: pair.sourcePosition!, destinationPosition: pair.destinationPosition! }));
+    if (!mappings.length) throw new Error("No aligned token positions are available for this patch scope");
+    setRunning(true);
+    try {
+      const result = await api.patch(
+        contrast.corruptedRun.id,
+        contrast.cleanRun.id,
+        componentIds,
+        mappings,
+        metricSpec(),
+      );
+      setRuns((current) => [result.run, ...current]);
+      setActiveRunId(result.run.id);
+      if (result.effect) setEffects((current) => ({ ...current, [result.run.id]: result.effect! }));
+      updateRuntimeForRun(result.run);
     } finally {
       setRunning(false);
     }
@@ -181,6 +254,8 @@ export function App() {
       setArchitecture(null);
       setRuns([]);
       setActiveRunId(null);
+      setContrast(null);
+      setEffects({});
     }
   };
 
@@ -217,6 +292,7 @@ export function App() {
         running={running}
         onPrimaryAction={architecture ? runPrompt : loadModel}
         onAddModel={() => setModelDialog(true)}
+        onExperiment={() => setExperimentDialog(true)}
       />
       <Workbench
         architecture={architecture}
@@ -226,11 +302,38 @@ export function App() {
         runs={runs}
         activeRun={activeRun}
         setActiveRunId={setActiveRunId}
-        zeroAblate={zeroAblate}
+        causalAblate={causalAblate}
+        patchActivations={patchActivations}
+        contrast={contrast}
+        effects={effects}
+        targetToken={targetToken}
+        distractorToken={distractorToken}
+        corruptedPrompt={corruptedPrompt}
+        onRestoreWorkspace={(snapshot) => {
+          setPrompt(snapshot.prompt);
+          setCorruptedPrompt(snapshot.corruptedPrompt);
+          setTargetToken(snapshot.targetToken);
+          setDistractorToken(snapshot.distractorToken);
+          chooseModel(snapshot.modelId);
+        }}
         running={running}
         connectionError={connectionError}
       />
       {modelDialog && <ModelDialog onClose={() => setModelDialog(false)} onRegister={registerModel} />}
+      {experimentDialog && <ExperimentDialog
+        cleanPrompt={prompt}
+        corruptedPrompt={corruptedPrompt}
+        targetToken={targetToken}
+        distractorToken={distractorToken}
+        setCleanPrompt={setPrompt}
+        setCorruptedPrompt={setCorruptedPrompt}
+        setTargetToken={setTargetToken}
+        setDistractorToken={setDistractorToken}
+        running={running}
+        loaded={Boolean(architecture)}
+        onClose={() => setExperimentDialog(false)}
+        onRun={() => void runContrast()}
+      />}
     </main>
   );
 }
@@ -248,8 +351,9 @@ function TopBar(props: {
   running: boolean;
   onPrimaryAction: () => void;
   onAddModel: () => void;
+  onExperiment: () => void;
 }) {
-  const { models, modelId, setModelId, prompt, setPrompt, architecture, runtime, activeRun, loading, running, onPrimaryAction, onAddModel } = props;
+  const { models, modelId, setModelId, prompt, setPrompt, architecture, runtime, activeRun, loading, running, onPrimaryAction, onAddModel, onExperiment } = props;
   const busy = loading || running || runtime?.loadState === "loading";
   return (
     <header className="top-bar">
@@ -279,13 +383,8 @@ function TopBar(props: {
         {busy ? <span className="spinner" /> : architecture ? <Play size={14} fill="currentColor" /> : <Download size={14} />}
         {loading ? "Loading model" : running ? "Running" : architecture ? "Run" : "Load model"}
       </button>
-      <div className="run-mode"><span>Run Mode</span><button><i className={`status-dot ${activeRun?.kind === "intervened" ? "intervened" : "clean"}`} />{activeRun?.label ?? "Clean Run"}<ChevronDown size={13} /></button></div>
-      <div className="top-actions">
-        <button aria-label="Undo" disabled><Undo2 /></button>
-        <button aria-label="Redo" disabled><Redo2 /></button>
-        <button aria-label="View settings"><SlidersHorizontal /></button>
-        <button aria-label="More"><EllipsisVertical /></button>
-      </div>
+      <button className="experiment-button" onClick={onExperiment} disabled={busy}><FlaskConical />Contrast</button>
+      <div className="run-mode"><span>Active Run</span><div className="run-state"><i className={`status-dot ${activeRun?.kind ?? "clean"}`} />{activeRun?.label ?? "No run yet"}</div></div>
     </header>
   );
 }
@@ -298,11 +397,18 @@ function Workbench(props: {
   runs: RunRecord[];
   activeRun: RunRecord | null;
   setActiveRunId: (runId: string) => void;
-  zeroAblate: (componentIds: string[]) => Promise<void>;
+  causalAblate: (componentIds: string[], kind: "zero_ablation" | "mean_ablation", positions: number[] | null) => Promise<void>;
+  patchActivations: (componentIds: string[], positions: number[] | null) => Promise<void>;
+  contrast: ContrastResult | null;
+  effects: Record<string, CausalEffect>;
+  targetToken: string;
+  distractorToken: string;
+  corruptedPrompt: string;
+  onRestoreWorkspace: (snapshot: WorkspaceSnapshot) => void;
   running: boolean;
   connectionError: string | null;
 }) {
-  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, zeroAblate, running, connectionError } = props;
+  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, causalAblate, patchActivations, contrast, effects, targetToken, distractorToken, corruptedPrompt, onRestoreWorkspace, running, connectionError } = props;
   const [selection, setSelection] = useState<string[]>([]);
   const [past, setPast] = useState<string[][]>([]);
   const [future, setFuture] = useState<string[][]>([]);
@@ -318,6 +424,13 @@ function Workbench(props: {
   const [activation, setActivation] = useState<ActivationSeries | null>(null);
   const [residual, setResidual] = useState<ResidualStreamResult | null>(null);
   const [comparison, setComparison] = useState<RunComparison | null>(null);
+  const [sweep, setSweep] = useState<HeadSweepResult | null>(null);
+  const [sweepLoading, setSweepLoading] = useState(false);
+  const [scopePosition, setScopePosition] = useState<number | null>(null);
+  const [groups, setGroups] = usePersistentJson<ComponentGroup[]>("kannaadi.groups", []);
+  const [groupDialog, setGroupDialog] = useState(false);
+  const [workspaceDialog, setWorkspaceDialog] = useState(false);
+  const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
   const [evidenceLoading, setEvidenceLoading] = useState(false);
   const [evidenceError, setEvidenceError] = useState<string | null>(null);
   const [leftWidth, setLeftWidth] = usePersistentNumber("kannaadi.panel.left", 220);
@@ -328,6 +441,12 @@ function Workbench(props: {
   const nodeIndex = useMemo(() => indexArchitecture(architecture), [architecture]);
   const selectedNodes = selection.map((id) => nodeIndex.get(id)).filter(Boolean) as ComponentNode[];
   const primary = selectedNodes.at(-1) || null;
+  const activeEffect = activeRun ? effects[activeRun.id] ?? null : null;
+  const scopedPositions = scopePosition === null ? null : [scopePosition];
+
+  useEffect(() => {
+    void listWorkspaces().then(setWorkspaceNames).catch(() => setWorkspaceNames([]));
+  }, []);
 
   const commitSelection = useCallback((next: string[]) => {
     setSelection((current) => {
@@ -433,18 +552,107 @@ function Workbench(props: {
     return () => window.removeEventListener("keydown", handleKey);
   });
 
-  const ablateSelected = async () => {
-    const heads = selectedNodes.filter((node) => node.kind === "head").map((node) => node.id);
+  const selectedHeadIds = () => selectedNodes.filter((node) => node.kind === "head").map((node) => node.id);
+
+  const ablateSelected = async (kind: "zero_ablation" | "mean_ablation") => {
+    const heads = selectedHeadIds();
     if (!heads.length) {
       setNotice("Select one or more attention heads to zero-ablate.");
       return;
     }
     try {
-      await zeroAblate(heads);
+      await causalAblate(heads, kind, scopedPositions);
       setActiveTab("Logits");
-      setNotice(`Created an exact all-token zero-ablation run for ${heads.length === 1 ? displayName(selectedNodes.find((node) => node.id === heads[0])!) : `${heads.length} heads`}.`);
+      const baseline = kind === "zero_ablation" ? "zero" : "within-prompt mean";
+      const scope = scopedPositions ? `token ${scopedPositions[0]}` : "all tokens";
+      setNotice(`Created an exact ${baseline} ablation at ${scope} for ${heads.length === 1 ? displayName(selectedNodes.find((node) => node.id === heads[0])!) : `${heads.length} heads`}.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Zero ablation failed");
+    }
+  };
+
+  const patchSelected = async () => {
+    const heads = selectedHeadIds();
+    if (!heads.length) return setNotice("Select one or more attention heads to patch.");
+    try {
+      await patchActivations(heads, scopedPositions);
+      setActiveTab("Logits");
+      setNotice(`Patched ${heads.length === 1 ? shortComponentId(heads[0]) : `${heads.length} heads`} from the clean source into the corrupted destination.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Activation patching failed");
+    }
+  };
+
+  const sweepHeads = async (kind: "zero_ablation" | "mean_ablation" = "zero_ablation") => {
+    const baselineId = activeRun?.kind === "intervened" || activeRun?.kind === "patched" ? activeRun.parentRunId : activeRun?.id;
+    if (!baselineId) return setNotice("Run a prompt before starting a causal sweep.");
+    if (!targetToken) return setNotice("Set a target token in Contrast setup before starting a sweep.");
+    setSweepLoading(true); setEvidenceError(null); setActiveTab("Causal Sweep");
+    try {
+      const result = await api.headSweep(baselineId, kind, scopedPositions, {
+        targetToken,
+        distractorToken: distractorToken || undefined,
+        position: -1,
+      });
+      setSweep(result);
+      setNotice(`Completed ${architecture?.nLayers ?? 0} × ${architecture?.nHeads ?? 0} exact head interventions in ${(result.durationMs / 1000).toFixed(1)} s.`);
+    } catch (error) {
+      setEvidenceError(error instanceof Error ? error.message : "Causal sweep failed");
+    } finally {
+      setSweepLoading(false);
+    }
+  };
+
+  const saveGroup = (name: string) => {
+    const ids = selectedHeadIds();
+    if (!ids.length) return setNotice("Select one or more heads before saving a group.");
+    setGroups((current) => [...current.filter((group) => group.name !== name), { id: crypto.randomUUID(), name, componentIds: ids }]);
+    setGroupDialog(false);
+    setNotice(`Saved ${ids.length} head${ids.length === 1 ? "" : "s"} as “${name}”.`);
+  };
+
+  const snapshot = (name: string): WorkspaceSnapshot => ({
+    format: "kannaadi-workspace",
+    version: 1,
+    name,
+    savedAt: new Date().toISOString(),
+    modelId: model.id,
+    prompt,
+    corruptedPrompt,
+    targetToken,
+    distractorToken,
+    selection,
+    groups,
+    expandedLayers: [...expanded],
+    expandedHeads: [...expandedHeads],
+    layout: { leftWidth, rightWidth, bottomHeight },
+  });
+
+  const saveCurrentWorkspace = async (name: string) => {
+    try {
+      const savedName = await saveWorkspace(snapshot(name));
+      setWorkspaceNames(await listWorkspaces());
+      setWorkspaceDialog(false);
+      setNotice(`Workspace “${savedName}” saved to application data.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Workspace could not be saved");
+    }
+  };
+
+  const openWorkspace = async (name: string) => {
+    try {
+      const saved = await loadWorkspace(name);
+      onRestoreWorkspace(saved);
+      setSelection(saved.selection);
+      setGroups(saved.groups);
+      setExpanded(new Set(saved.expandedLayers));
+      setExpandedHeads(new Set(saved.expandedHeads));
+      setLeftWidth(saved.layout.leftWidth);
+      setRightWidth(saved.layout.rightWidth);
+      setBottomHeight(saved.layout.bottomHeight);
+      setNotice(`Workspace “${saved.name}” restored. Run manifests are intentionally recomputed for the current model session.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Workspace could not be opened");
     }
   };
 
@@ -457,7 +665,7 @@ function Workbench(props: {
   return (
     <>
       <div className="workspace-grid" style={layoutStyle} onClick={() => contextMenu && setContextMenu(null)}>
-        <LeftSidebar selected={selectedNodes} architecture={architecture} runs={runs} activeRun={activeRun} onSelectRun={setActiveRunId} />
+        <LeftSidebar selected={selectedNodes} architecture={architecture} runs={runs} activeRun={activeRun} onSelectRun={setActiveRunId} groups={groups} onSelectGroup={(group) => commitSelection(group.componentIds)} workspaceNames={workspaceNames} onOpenWorkspace={(name) => void openWorkspace(name)} onSaveWorkspace={() => setWorkspaceDialog(true)} />
         <PanelResizer label="Resize left sidebar" direction="vertical" onDelta={(delta) => setLeftWidth(clamp(leftWidth + delta, 160, 420))} onReset={() => setLeftWidth(220)} />
         <section className="center-stage">
           <ArchitecturePanel
@@ -477,6 +685,7 @@ function Workbench(props: {
             pan={pan}
             setPan={setPan}
             commitSelection={commitSelection}
+            overlay={sweep}
             undo={undo}
             redo={redo}
             canUndo={past.length > 0}
@@ -495,6 +704,11 @@ function Workbench(props: {
             activation={activation}
             residual={residual}
             comparison={comparison}
+            contrast={contrast}
+            effect={activeEffect}
+            sweep={sweep}
+            sweepLoading={sweepLoading}
+            onSweep={(kind) => void sweepHeads(kind)}
             loading={evidenceLoading}
             error={evidenceError}
           />
@@ -507,52 +721,71 @@ function Workbench(props: {
           activeRun={activeRun}
           running={running}
           onInspect={() => setActiveTab(primary?.kind === "head" ? "Attention" : "Activations")}
-          onZeroAblate={ablateSelected}
+          scopePosition={scopePosition}
+          setScopePosition={setScopePosition}
+          onZeroAblate={() => void ablateSelected("zero_ablation")}
+          onMeanAblate={() => void ablateSelected("mean_ablation")}
+          onPatch={() => void patchSelected()}
+          onSweep={() => void sweepHeads("zero_ablation")}
+          canPatch={Boolean(contrast)}
+          onSaveGroup={() => setGroupDialog(true)}
           onReturnToClean={() => activeRun?.parentRunId && setActiveRunId(activeRun.parentRunId)}
           onAction={setNotice}
         />
       </div>
       <StatusBar architecture={architecture} runtime={runtime} activeRun={activeRun} />
-      {contextMenu && <ContextMenu menu={contextMenu} run={activeRun} onClose={() => setContextMenu(null)} onInspect={() => { selectNode(contextMenu.node); setActiveTab(contextMenu.node.kind === "head" ? "Attention" : "Activations"); setContextMenu(null); }} onAblate={() => { selectNode(contextMenu.node); setContextMenu(null); window.setTimeout(() => void zeroAblate([contextMenu.node.id]), 0); }} onAction={setNotice} />}
+      {contextMenu && <ContextMenu menu={contextMenu} run={activeRun} canPatch={Boolean(contrast)} onClose={() => setContextMenu(null)} onInspect={() => { selectNode(contextMenu.node); setActiveTab(contextMenu.node.kind === "head" ? "Attention" : "Activations"); setContextMenu(null); }} onExpand={() => { const node = contextMenu.node; if (node.layer !== undefined) setExpanded(new Set([...expanded, node.layer])); if (node.kind === "head") setExpandedHeads(new Set([...expandedHeads, node.id])); selectNode(node); setContextMenu(null); }} onAblate={() => { const node = contextMenu.node; selectNode(node); setContextMenu(null); window.setTimeout(() => void causalAblate([node.id], "zero_ablation", scopedPositions), 0); }} onPatch={() => { const node = contextMenu.node; selectNode(node); setContextMenu(null); window.setTimeout(() => void patchActivations([node.id], scopedPositions), 0); }} onAction={setNotice} />}
       {notice && <div className="toast" role="status"><Info size={15} />{notice}<button aria-label="Dismiss" onClick={() => setNotice(null)}><X /></button></div>}
+      {groupDialog && <NameDialog title="Save component group" description="Reuse this head selection for batch interventions and workspace snapshots." action="Save group" onClose={() => setGroupDialog(false)} onSubmit={saveGroup} />}
+      {workspaceDialog && <NameDialog title="Save workspace" description="Saves prompts, metric, selections, groups, expanded components, and panel layout." action="Save workspace" onClose={() => setWorkspaceDialog(false)} onSubmit={(name) => void saveCurrentWorkspace(name)} />}
     </>
   );
 }
 
-function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun }: {
+function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun, groups, onSelectGroup, workspaceNames, onOpenWorkspace, onSaveWorkspace }: {
   selected: ComponentNode[];
   architecture: ArchitectureGraph | null;
   runs: RunRecord[];
   activeRun: RunRecord | null;
   onSelectRun: (runId: string) => void;
+  groups: ComponentGroup[];
+  onSelectGroup: (group: ComponentGroup) => void;
+  workspaceNames: string[];
+  onOpenWorkspace: (name: string) => void;
+  onSaveWorkspace: () => void;
 }) {
   return (
     <aside className="left-sidebar panel">
       <SidebarSection title="Prompts" icon={<FileJson />}><button className="side-item active">The capital of France is</button></SidebarSection>
       <SidebarSection title="Runs" icon={<History />}>
-        {runs.map((run) => <button className={`side-item run-item ${activeRun?.id === run.id ? "active" : ""}`} key={run.id} onClick={() => onSelectRun(run.id)}><i className={`status-dot ${run.kind === "clean" ? "clean" : "intervened"}`} /><span>{run.label}</span><small>{run.durationMs.toFixed(0)} ms</small></button>)}
+        {runs.map((run) => <button className={`side-item run-item ${activeRun?.id === run.id ? "active" : ""}`} key={run.id} onClick={() => onSelectRun(run.id)}><i className={`status-dot ${run.kind}`} /><span>{run.label}</span><small>{run.durationMs.toFixed(0)} ms</small></button>)}
         {!runs.length && <div className="empty-side"><i className="status-dot muted" />Run a prompt to begin</div>}
       </SidebarSection>
       <SidebarSection title="Interventions" icon={<Sparkles />}>
-        {runs.filter((run) => run.kind === "intervened").map((run) => <button className="side-item" key={run.id} onClick={() => onSelectRun(run.id)}>{run.interventions[0]?.componentIds.map(shortComponentId).join(", ")}</button>)}
-        {!runs.some((run) => run.kind === "intervened") && <div className="empty-side">No interventions yet</div>}
+        {runs.filter((run) => run.kind === "intervened" || run.kind === "patched").map((run) => <button className="side-item" key={run.id} onClick={() => onSelectRun(run.id)}><span>{run.interventions[0]?.kind.replaceAll("_", " ")}</span><small>{run.interventions[0]?.componentIds.map(shortComponentId).join(", ")}</small></button>)}
+        {!runs.some((run) => run.kind === "intervened" || run.kind === "patched") && <div className="empty-side">No interventions yet</div>}
       </SidebarSection>
       <SidebarSection title={`Selections (${selected.length})`} icon={<Layers3 />}>
         {selected.slice(-4).map((node) => <button className="side-item selection-item" key={node.id}><ComponentGlyph kind={node.kind} />{displayName(node)}</button>)}
         {selected.length > 4 && <button className="view-all">View all {selected.length}</button>}
         {!selected.length && <div className="empty-side">Select a component</div>}
       </SidebarSection>
-      <SidebarSection title="Workspaces" icon={<Database />}><div className="empty-side">Layout and prompt autosaved</div></SidebarSection>
+      <SidebarSection title={`Groups (${groups.length})`} icon={<Layers3 />}>
+        {groups.map((group) => <button className="side-item" key={group.id} onClick={() => onSelectGroup(group)}><span>{group.name}</span><small>{group.componentIds.length} heads</small></button>)}
+        {!groups.length && <div className="empty-side">Save a selection to reuse it</div>}
+      </SidebarSection>
+      <SidebarSection title="Workspaces" icon={<Database />}>
+        {workspaceNames.map((name) => <button className="side-item" key={name} onClick={() => onOpenWorkspace(name)}><FolderOpen />{name}</button>)}
+        <button className="view-all" onClick={onSaveWorkspace}><Save />Save current workspace</button>
+      </SidebarSection>
       <div className="sidebar-spacer" />
-      <button className="settings-row"><Settings2 />Settings</button>
-      <button className="collapse-sidebar" aria-label="Collapse sidebar"><PanelLeftClose /></button>
       {architecture && <div className="schema-badge">{architecture.family} · model-derived</div>}
     </aside>
   );
 }
 
 function SidebarSection({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
-  return <section className="sidebar-section"><header><span>{title}</span><button aria-label={`Add ${title}`}><Plus /></button></header><div className="sidebar-section-icon">{icon}</div>{children}</section>;
+  return <section className="sidebar-section"><header><span>{title}</span></header><div className="sidebar-section-icon">{icon}</div>{children}</section>;
 }
 
 function ArchitecturePanel(props: {
@@ -572,12 +805,13 @@ function ArchitecturePanel(props: {
   pan: { x: number; y: number };
   setPan: (value: { x: number; y: number }) => void;
   commitSelection: (ids: string[]) => void;
+  overlay: HeadSweepResult | null;
   undo: () => void;
   redo: () => void;
   canUndo: boolean;
   canRedo: boolean;
 }) {
-  const { architecture, error, selection, expanded, setExpanded, expandedHeads, setExpandedHeads, selectNode, contextNode, tool, setTool, zoom, setZoom, pan, setPan, commitSelection } = props;
+  const { architecture, error, selection, expanded, setExpanded, expandedHeads, setExpandedHeads, selectNode, contextNode, tool, setTool, zoom, setZoom, pan, setPan, commitSelection, overlay } = props;
   const viewport = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const zoomRef = useRef(zoom);
@@ -687,8 +921,7 @@ function ArchitecturePanel(props: {
         <div className="canvas-toolbar-right">
           {architecture && <button className="expand-all-button" onClick={toggleAll}>{expanded.size === architecture.nLayers ? "Collapse all" : "Expand all"}</button>}
           <label className="zoom-slider">Zoom <strong>{Math.round(zoom * 100)}%</strong><input aria-label="Zoom" type="range" min="5" max="200" value={zoom * 100} onChange={(event) => zoomAt(Number(event.target.value) / 100)} /></label>
-          <button className="icon-button" aria-label="Canvas settings"><Settings2 /></button>
-          <button className="legend-button"><Layers3 />Legend</button>
+          <span className={`legend-button ${overlay ? "overlay-active" : ""}`}><Layers3 />{overlay ? "Causal effect" : "Architecture"}</span>
         </div>
       </div>
       <div ref={viewport} className={`canvas-viewport tool-${tool}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp}>
@@ -708,6 +941,7 @@ function ArchitecturePanel(props: {
                 toggleHead={(headId) => { const next = new Set(expandedHeads); next.has(headId) ? next.delete(headId) : next.add(headId); setExpandedHeads(next); }}
                 selectNode={selectNode}
                 contextNode={contextNode}
+                overlay={overlay}
               />
             ))}
             <ModelBoundaryRow mode="input" architecture={architecture} selection={selection} selectNode={selectNode} />
@@ -730,7 +964,7 @@ function ModelBoundaryRow({ mode, architecture, selection, selectNode }: {
   return <div className={`model-boundary-row ${mode}`}><span>{mode === "input" ? "Model input" : "Model output"}</span><div>{nodes.map((node) => <button key={node.id} data-component-id={node.id} className={selection.includes(node.id) ? "component-selected" : ""} onClick={(event) => selectNode(node, event.shiftKey)}><ComponentGlyph kind={node.kind} />{node.label}<small>{node.activationPoints[0]}</small></button>)}{mode === "output" && <span className="logits-node">Vocabulary logits · {architecture.vocabularySize.toLocaleString()}</span>}</div></div>;
 }
 
-function LayerRow({ layer, architecture, expanded, expandedHeads, selected, toggle, toggleHead, selectNode, contextNode }: {
+function LayerRow({ layer, architecture, expanded, expandedHeads, selected, toggle, toggleHead, selectNode, contextNode, overlay }: {
   layer: LayerNode;
   architecture: ArchitectureGraph;
   expanded: boolean;
@@ -740,6 +974,7 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
   toggleHead: (headId: string) => void;
   selectNode: (node: ComponentNode, additive?: boolean) => void;
   contextNode: (node: ComponentNode, x: number, y: number) => void;
+  overlay: HeadSweepResult | null;
 }) {
   const openHead = layer.heads.find((head) => expandedHeads.has(head.id));
   const layerSelected = [layer.attention, layer.mlp, layer.norm1, layer.norm2, ...layer.heads].some((node) => selected.includes(node.id));
@@ -752,7 +987,7 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
       <div className="attention-stage">
         {expanded && <button className={`norm-chip ${selected.includes(layer.norm1.id) ? "component-selected" : ""}`} data-component-id={layer.norm1.id} onClick={(event) => choose(layer.norm1, event)}>{architecture.normType}</button>}
         <button data-component-id={layer.attention.id} className={`attention-block ${selected.includes(layer.attention.id) ? "component-selected" : ""}`} onClick={(event) => choose(layer.attention, event)} onContextMenu={(event) => context(layer.attention, event)}><span>{expanded ? `Layer ${layer.index} attention` : "Multi-Head Attention"}</span>{expanded && <small>{architecture.nHeads} query heads · {architecture.nKeyValueHeads} KV heads</small>}</button>
-        {expanded && <div className="heads-container" style={{ "--heads": architecture.nHeads } as CSSProperties}>{layer.heads.map((head) => <button key={head.id} data-component-id={head.id} className={selected.includes(head.id) ? "component-selected" : ""} onClick={(event) => choose(head, event)} onDoubleClick={() => toggleHead(head.id)} onContextMenu={(event) => context(head, event)} aria-label={`Select L${layer.index}H${head.head}`}>H{head.head}</button>)}</div>}
+        {expanded && <div className="heads-container" style={{ "--heads": architecture.nHeads } as CSSProperties}>{layer.heads.map((head) => { const effect = overlay?.effects.find((value) => value.componentId === head.id); return <button key={head.id} data-component-id={head.id} className={`${selected.includes(head.id) ? "component-selected" : ""} ${effect ? "causal-overlay" : ""}`} style={effect ? causalOverlayStyle(effect.delta, Math.max(Math.abs(overlay!.minimum), Math.abs(overlay!.maximum))) : undefined} title={effect ? `${shortComponentId(head.id)}: ${signed(effect.delta)} metric change` : head.id} onClick={(event) => choose(head, event)} onDoubleClick={() => toggleHead(head.id)} onContextMenu={(event) => context(head, event)} aria-label={`Select L${layer.index}H${head.head}`}>H{head.head}{effect && <small>{signedCompact(effect.delta)}</small>}</button>; })}</div>}
         {expanded && openHead && <div className="head-internals"><header><span>{displayName(openHead)}</span><button onClick={() => toggleHead(openHead.id)}><X /></button></header><div>{openHead.children.map((child, index) => <span key={child.id}><button data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>{index < openHead.children.length - 1 && <i>→</i>}</span>)}</div></div>}
       </div>
       <div className="residual-add"><span className="flow-line" /><button data-component-id={layer.residualMid.id} title={layer.residualMid.id} onClick={(event) => choose(layer.residualMid, event)}><Plus /></button></div>
@@ -762,7 +997,7 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
         {expanded && <div className="mlp-internals">{layer.mlp.children.map((child) => <button key={child.id} data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>)}</div>}
       </div>
       <div className="residual-exit"><span className="flow-line" /><button data-component-id={layer.residualPost.id} title={layer.residualPost.id} onClick={(event) => choose(layer.residualPost, event)}><Plus /></button><span className="flow-tail" /></div>
-      <button className="row-more" onContextMenu={(event) => context(layer.residualPost, event)} aria-label={`More actions for layer ${layer.index}`}><EllipsisVertical /></button>
+      <button className="row-more" onClick={(event) => context(layer.residualPost, event)} onContextMenu={(event) => context(layer.residualPost, event)} aria-label={`More actions for layer ${layer.index}`}><EllipsisVertical /></button>
     </article>
   );
 }
@@ -778,15 +1013,22 @@ function Inspector(props: {
   activeRun: RunRecord | null;
   running: boolean;
   onInspect: () => void;
+  scopePosition: number | null;
+  setScopePosition: (position: number | null) => void;
   onZeroAblate: () => void;
+  onMeanAblate: () => void;
+  onPatch: () => void;
+  onSweep: () => void;
+  canPatch: boolean;
+  onSaveGroup: () => void;
   onReturnToClean: () => void;
   onAction: (message: string) => void;
 }) {
-  const { architecture, selected, selectedCount, activeRun, running, onInspect, onZeroAblate, onReturnToClean, onAction } = props;
+  const { architecture, selected, selectedCount, activeRun, running, onInspect, scopePosition, setScopePosition, onZeroAblate, onMeanAblate, onPatch, onSweep, canPatch, onSaveGroup, onReturnToClean, onAction } = props;
   const hook = selected?.activationPoints[0] || "—";
   return (
     <aside className="inspector panel">
-      <header className="inspector-bar"><span>Inspector</span><small>{selectedCount ? `${selectedCount} selected` : "No selection"}</small><button aria-label="Close inspector"><X /></button></header>
+      <header className="inspector-bar"><span>Inspector</span><small>{selectedCount ? `${selectedCount} selected` : "No selection"}</small></header>
       {!selected ? <div className="inspector-empty"><Crosshair /><p>Select a component on the architecture canvas.</p></div> : <>
         <div className="inspector-heading"><ComponentGlyph kind={selected.kind} large /><h2>{displayName(selected)}</h2><span className="type-pill">{typeLabel(selected.kind)}</span></div>
         <dl className="inspector-properties">
@@ -799,14 +1041,18 @@ function Inspector(props: {
           <div><dt>Current Run</dt><dd>{activeRun?.label ?? "Not run"}</dd></div>
         </dl>
         <section className="about-component"><h3>About</h3><p>{componentDescription(selected, architecture)}</p><code>Shape: {shapeFor(selected, architecture)}</code></section>
+        {selected.kind === "head" && activeRun && <label className="intervention-scope"><span>Intervention scope</span><select value={scopePosition ?? "all"} onChange={(event) => setScopePosition(event.target.value === "all" ? null : Number(event.target.value))}><option value="all">All token positions</option>{activeRun.tokens.map((token) => <option key={token.position} value={token.position}>Position {token.position}: {token.display}</option>)}</select></label>}
         <section className="inspector-actions"><h3>Actions</h3><div>
           <ActionButton icon={<Eye />} label="Inspect" onClick={onInspect} />
           <ActionButton icon={<CircleDot />} label="Zero Ablate" disabled={running || !activeRun || !selectedCount || selected.kind !== "head"} onClick={onZeroAblate} />
-          <ActionButton icon={<SquareDashedMousePointer />} label="Patch…" disabled onClick={() => onAction("Activation patching will use clean and corrupted source runs in the next workflow.")} />
-          <ActionButton icon={<Tag />} label="Label…" onClick={() => onAction("Component annotations will be saved with workspace snapshots.")} />
-          {activeRun?.kind === "intervened" ? <ActionButton wide icon={<RotateCcw />} label="Return to Clean Run" onClick={onReturnToClean} /> : <ActionButton wide icon={<Save />} label="Save Selection" onClick={() => { localStorage.setItem("kannaadi.selection", JSON.stringify([selected.id])); onAction("Selection saved in this workspace."); }} />}
+          <ActionButton icon={<Activity />} label="Mean Ablate" disabled={running || !activeRun || !selectedCount || selected.kind !== "head"} onClick={onMeanAblate} />
+          <ActionButton icon={<SquareDashedMousePointer />} label="Patch…" disabled={running || !canPatch || selected.kind !== "head"} onClick={onPatch} />
+          <ActionButton wide icon={<FlaskConical />} label="Sweep all heads" disabled={running || !activeRun} onClick={onSweep} />
+          <ActionButton icon={<Code2 />} label="Copy ID" onClick={() => { void navigator.clipboard?.writeText(selected.id); onAction("Canonical component ID copied."); }} />
+          <ActionButton icon={<Save />} label="Save Group" disabled={selected.kind !== "head"} onClick={onSaveGroup} />
+          {(activeRun?.kind === "intervened" || activeRun?.kind === "patched") && <ActionButton wide icon={<RotateCcw />} label="Return to Baseline" onClick={onReturnToClean} />}
         </div></section>
-        <section className="method-scope"><Info /><div><strong>{activeRun ? "Run evidence" : "Architecture metadata"}</strong><span>{activeRun ? `${activeRun.kind === "clean" ? "Clean forward pass" : "Exact zero ablation"} · ${activeRun.device} · ${activeRun.dtype}` : "Select Run to collect prompt-specific evidence."}</span></div></section>
+        <section className="method-scope"><Info /><div><strong>{activeRun ? "Run evidence" : "Architecture metadata"}</strong><span>{activeRun ? `${runMethodLabel(activeRun)} · ${activeRun.device} · ${activeRun.dtype}` : "Select Run to collect prompt-specific evidence."}</span></div></section>
       </>}
     </aside>
   );
@@ -824,20 +1070,28 @@ function AnalysisPanel(props: {
   activation: ActivationSeries | null;
   residual: ResidualStreamResult | null;
   comparison: RunComparison | null;
+  contrast: ContrastResult | null;
+  effect: CausalEffect | null;
+  sweep: HeadSweepResult | null;
+  sweepLoading: boolean;
+  onSweep: (kind: "zero_ablation" | "mean_ablation") => void;
   loading: boolean;
   error: string | null;
 }) {
-  const { activeTab, setActiveTab, architecture, selected, model, prompt, run, attention, activation, residual, comparison, loading, error } = props;
-  const tabs: PanelTab[] = ["Tokens", "Attention", "QK / OV", "Logits", "Activations", "Residual Stream", "Code"];
+  const { activeTab, setActiveTab, architecture, selected, model, prompt, run, attention, activation, residual, comparison, contrast, effect, sweep, sweepLoading, onSweep, loading, error } = props;
+  const tabs: PanelTab[] = ["Tokens", "Alignment", "Attention", "QK / OV", "Logits", "Activations", "Residual Stream", "Causal Sweep", "Code"];
   let content: ReactNode;
   if (activeTab === "Code") content = <CodePanel architecture={architecture} selected={selected} model={model} prompt={prompt} run={run} />;
+  else if (activeTab === "Alignment") content = contrast ? <AlignmentPanel contrast={contrast} /> : <EvidencePrompt message="Open Contrast setup and run a clean/corrupted prompt pair to inspect token alignment." />;
+  else if (activeTab === "Causal Sweep" && sweepLoading) content = <EvidenceLoading message="Running exact batched head interventions…" />;
+  else if (activeTab === "Causal Sweep") content = sweep ? <SweepPanel result={sweep} /> : <SweepEmpty onSweep={onSweep} disabled={!run} />;
   else if (!run) content = <EvidenceEmpty tab={activeTab} selected={selected} />;
   else if (loading) content = <EvidenceLoading />;
   else if (error) content = <EvidenceError message={error} />;
   else if (activeTab === "Tokens") content = <TokensPanel run={run} />;
   else if (activeTab === "Attention") content = attention ? <AttentionPanel result={attention} mode="pattern" /> : <EvidencePrompt message="Select an attention head to inspect its token-to-token pattern." />;
   else if (activeTab === "QK / OV") content = attention ? <QkovPanel result={attention} /> : <EvidencePrompt message="Select an attention head to inspect QK scores and projected result strength." />;
-  else if (activeTab === "Logits") content = <LogitsPanel run={run} comparison={comparison} />;
+  else if (activeTab === "Logits") content = <LogitsPanel run={run} comparison={comparison} effect={effect} />;
   else if (activeTab === "Activations") content = activation ? <ActivationPanel result={activation} /> : <EvidencePrompt message="Select a component with a cached activation." />;
   else content = residual ? <ResidualPanel result={residual} /> : <EvidencePrompt message="Residual-stream evidence is available after a run." />;
   return <section className="analysis-panel panel"><nav>{tabs.map((tab) => <button className={activeTab === tab ? "active" : ""} key={tab} onClick={() => setActiveTab(tab)}>{tab}</button>)}</nav><div className="analysis-content">{content}</div></section>;
@@ -845,6 +1099,23 @@ function AnalysisPanel(props: {
 
 function TokensPanel({ run }: { run: RunRecord }) {
   return <div className="tokens-panel"><section><header><span>Prompt tokens</span><small>{run.tokens.length} tokens</small></header><table><thead><tr><th>Pos</th><th>Token</th><th>ID</th><th>Top next-token prediction</th><th>Probability</th></tr></thead><tbody>{run.tokens.map((token) => <tr key={token.position}><td>{token.position}</td><td><code>{token.display}</code></td><td>{token.tokenId}</td><td><code>{token.nextToken}</code></td><td>{formatPercent(token.nextTokenProbability ?? 0)}</td></tr>)}</tbody></table></section><Predictions predictions={run.topPredictions} /></div>;
+}
+
+function AlignmentPanel({ contrast }: { contrast: ContrastResult }) {
+  const alignment = contrast.alignment;
+  return <div className="alignment-panel"><header><div><strong>Clean ↔ corrupted token alignment</strong><span>Minimum-edit alignment used for activation patch mappings</span></div><div><small>Exact matches</small><strong>{alignment.exactMatches}/{Math.max(alignment.sourceLength, alignment.destinationLength)}</strong></div></header><div className="alignment-grid"><span>Clean source</span><span>Relation</span><span>Corrupted destination</span>{alignment.pairs.map((pair, index) => <div className={`alignment-pair ${pair.status}`} key={`${pair.sourcePosition}-${pair.destinationPosition}-${index}`}><code>{pair.sourcePosition === null ? "—" : `${pair.sourcePosition}  ${pair.sourceToken}`}</code><span>{pair.status === "exact" ? "=" : pair.status === "substitution" ? "→" : "gap"}<small>{pair.status.replaceAll("_", " ")}</small></span><code>{pair.destinationPosition === null ? "—" : `${pair.destinationPosition}  ${pair.destinationToken}`}</code></div>)}</div><footer><Info />Substitutions are position mappings, not claims of semantic equivalence. Review the alignment before interpreting a patch.</footer></div>;
+}
+
+function SweepEmpty({ onSweep, disabled }: { onSweep: (kind: "zero_ablation" | "mean_ablation") => void; disabled: boolean }) {
+  return <div className="sweep-empty"><FlaskConical /><div><h3>Whole-model causal sweep</h3><p>Measure every attention head against the target metric. Kannaadi batches all heads in a layer into one exact forward pass.</p></div><div><button disabled={disabled} onClick={() => onSweep("zero_ablation")}><CircleDot />Zero sweep</button><button disabled={disabled} onClick={() => onSweep("mean_ablation")}><Activity />Mean sweep</button></div></div>;
+}
+
+function SweepPanel({ result }: { result: HeadSweepResult }) {
+  const layers = [...new Set(result.effects.map((effect) => effect.layer))];
+  const heads = [...new Set(result.effects.map((effect) => effect.head))];
+  const maximum = Math.max(Math.abs(result.minimum), Math.abs(result.maximum), 1e-9);
+  const strongest = [...result.effects].sort((left, right) => Math.abs(right.delta) - Math.abs(left.delta)).slice(0, 5);
+  return <div className="sweep-panel"><header><div><strong>{result.kind === "zero_ablation" ? "Zero-ablation" : "Within-prompt mean-ablation"} sweep</strong><span>{result.metric.metric.replaceAll("_", " ")} at position {result.metric.position} · baseline {result.metric.value.toFixed(3)}</span></div><div><small>Runtime</small><strong>{(result.durationMs / 1000).toFixed(1)} s</strong></div></header><div className="sweep-body"><div className="sweep-matrix" style={{ "--sweep-heads": heads.length } as CSSProperties}><span className="corner">Layer</span>{heads.map((head) => <span key={head}>H{head}</span>)}{layers.map((layer) => <div className="sweep-row" key={layer}><strong>L{layer}</strong>{heads.map((head) => { const effect = result.effects.find((item) => item.layer === layer && item.head === head)!; return <button key={head} style={causalOverlayStyle(effect.delta, maximum)} title={`L${layer}H${head}: ${signed(effect.delta)}`}>{signedCompact(effect.delta)}</button>; })}</div>)}</div><aside><h4>Strongest effects</h4>{strongest.map((effect) => <div key={effect.componentId}><code>{shortComponentId(effect.componentId)}</code><span className={effect.delta < 0 ? "negative" : "positive"}>{signed(effect.delta)}</span></div>)}<p>Δ = intervened metric − baseline metric</p></aside></div><footer><span className="negative">decreases metric</span><i /><span className="positive">increases metric</span></footer></div>;
 }
 
 function Predictions({ predictions }: { predictions: RunRecord["topPredictions"] }) {
@@ -873,9 +1144,10 @@ function MetricBar({ label, value, maximum }: { label: string; value: number; ma
   return <span className="metric-bar"><small>{label}</small><i><b style={{ width: `${value / (maximum || 1) * 100}%` }} /></i><strong>{value.toFixed(2)}</strong></span>;
 }
 
-function LogitsPanel({ run, comparison }: { run: RunRecord; comparison: RunComparison | null }) {
-  if (run.kind === "clean" || !comparison) return <div className="logits-clean"><Predictions predictions={run.topPredictions} /><EvidencePrompt message="Zero-ablate a selected head to compare its causal effect on the output distribution." /></div>;
-  return <div className="comparison-panel"><header><div><strong>Clean versus intervention</strong><span>Baseline top token <code>{visibleToken(comparison.baselineTopToken)}</code> changed by <b className={comparison.baselineTopTokenDelta < 0 ? "negative" : "positive"}>{signed(comparison.baselineTopTokenDelta)}</b> logits</span></div><div><small>KL divergence</small><strong>{comparison.klDivergence.toFixed(5)}</strong></div></header><table><thead><tr><th>Token</th><th>Clean probability</th><th>Intervened</th><th>Δ probability</th><th>Δ logit</th></tr></thead><tbody>{comparison.tokens.map((token) => <tr key={token.tokenId}><td><code>{token.display}</code></td><td>{formatPercent(token.baselineProbability)}</td><td>{formatPercent(token.intervenedProbability)}</td><td className={token.deltaProbability < 0 ? "negative" : "positive"}>{signed(token.deltaProbability * 100)} pp</td><td className={token.deltaLogit < 0 ? "negative" : "positive"}>{signed(token.deltaLogit)}</td></tr>)}</tbody></table><footer><Info />Exact forward passes with the selected head result set to zero at all token positions. Zero ablation can be out of distribution; compare alternative baselines before making a broad mechanistic claim.</footer></div>;
+function LogitsPanel({ run, comparison, effect }: { run: RunRecord; comparison: RunComparison | null; effect: CausalEffect | null }) {
+  if ((run.kind === "clean" || run.kind === "corrupted") || !comparison) return <div className="logits-clean"><Predictions predictions={run.topPredictions} /><EvidencePrompt message="Apply a scoped ablation or clean-to-corrupted patch to compare its causal effect on the output distribution." /></div>;
+  const intervention = run.interventions[0];
+  return <div className="comparison-panel">{effect && <section className="metric-effect"><div><small>{effect.intervened.metric.replaceAll("_", " ")}</small><strong><code>{visibleToken(effect.intervened.targetToken)}</code>{effect.intervened.distractorToken ? <> − <code>{visibleToken(effect.intervened.distractorToken)}</code></> : null}</strong></div><span>{effect.baseline.value.toFixed(3)} → {effect.intervened.value.toFixed(3)}</span><b className={effect.delta < 0 ? "negative" : "positive"}>{signed(effect.delta)}</b></section>}<header><div><strong>Baseline versus intervention</strong><span>Baseline top token <code>{visibleToken(comparison.baselineTopToken)}</code> changed by <b className={comparison.baselineTopTokenDelta < 0 ? "negative" : "positive"}>{signed(comparison.baselineTopTokenDelta)}</b> logits</span></div><div><small>KL divergence</small><strong>{comparison.klDivergence.toFixed(5)}</strong></div></header><table><thead><tr><th>Token</th><th>Baseline probability</th><th>Intervened</th><th>Δ probability</th><th>Δ logit</th></tr></thead><tbody>{comparison.tokens.map((token) => <tr key={token.tokenId}><td><code>{token.display}</code></td><td>{formatPercent(token.baselineProbability)}</td><td>{formatPercent(token.intervenedProbability)}</td><td className={token.deltaProbability < 0 ? "negative" : "positive"}>{signed(token.deltaProbability * 100)} pp</td><td className={token.deltaLogit < 0 ? "negative" : "positive"}>{signed(token.deltaLogit)}</td></tr>)}</tbody></table><footer><Info />Exact {intervention.kind.replaceAll("_", " ")} at {intervention.tokenScope === "all" ? "all token positions" : `positions ${intervention.positions.join(", ")}`}. {intervention.kind === "mean_ablation" ? "The reference is this run’s mean head result across positions, not a dataset mean." : intervention.kind === "zero_ablation" ? "Zero ablation can be out of distribution; compare baselines before making a broad mechanistic claim." : "Patched activations come from the aligned clean source run."}</footer></div>;
 }
 
 function ActivationPanel({ result }: { result: ActivationSeries }) {
@@ -897,6 +1169,44 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
   const intervention = run?.interventions[0];
   const component = intervention?.componentIds[0];
   const match = component?.match(/^blocks\.(\d+)\.attn\.head\.(\d+)$/);
+  const hookName = match ? `blocks.${match[1]}.attn.hook_result` : null;
+  const positions = intervention?.tokenScope === "positions" ? intervention.positions : run?.tokens.map((token) => token.position) ?? [];
+  const interventionLines = !match || !intervention ? [] : intervention.kind === "activation_patch" ? [
+    "",
+    `source_prompt = ${JSON.stringify(prompt)}`,
+    `destination_prompt = ${JSON.stringify(run?.prompt ?? prompt)}`,
+    "source_tokens = model.to_tokens(source_prompt)",
+    "destination_tokens = model.to_tokens(destination_prompt)",
+    "_, source_cache = model.run_with_cache(source_tokens)",
+    `hook_name = ${JSON.stringify(hookName)}`,
+    `head_index = ${match[2]}`,
+    `patch_mappings = ${JSON.stringify(intervention.patchMappings.map((mapping) => [mapping.sourcePosition, mapping.destinationPosition]))}`,
+    "",
+    "def patch_head(result, hook):",
+    "    result = result.clone()",
+    "    for source_pos, destination_pos in patch_mappings:",
+    "        result[:, destination_pos, head_index, :] = source_cache[hook_name][:, source_pos, head_index, :]",
+    "    return result",
+    "",
+    "patched_logits = model.run_with_hooks(",
+    "    destination_tokens, fwd_hooks=[(hook_name, patch_head)]",
+    ")",
+  ] : [
+    "",
+    `hook_name = ${JSON.stringify(hookName)}`,
+    `head_index = ${match[2]}`,
+    `positions = ${JSON.stringify(positions)}`,
+    ...(intervention.kind === "mean_ablation" ? ["mean_result = cache[hook_name][:, :, head_index, :].mean(dim=1)"] : []),
+    "",
+    `def ${intervention.kind === "mean_ablation" ? "mean_ablate_head" : "zero_head"}(result, hook):`,
+    "    result = result.clone()",
+    intervention.kind === "mean_ablation" ? "    result[:, positions, head_index, :] = mean_result[:, None, :]" : "    result[:, positions, head_index, :] = 0",
+    "    return result",
+    "",
+    "intervened_logits = model.run_with_hooks(",
+    `    tokens, fwd_hooks=[(hook_name, ${intervention.kind === "mean_ablation" ? "mean_ablate_head" : "zero_head"})]`,
+    ")",
+  ];
   const lines = [
     "from transformer_lens import HookedTransformer",
     "import torch",
@@ -909,20 +1219,7 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
     "# Clean run and reusable activation cache",
     "logits, cache = model.run_with_cache(tokens)",
     selectedHead ? `pattern = cache[${JSON.stringify(`blocks.${selectedHead.layer}.attn.hook_pattern`)}][0, ${selectedHead.head}]` : "# Select a head to generate its attention lookup",
-    ...(match ? [
-      "",
-      `hook_name = ${JSON.stringify(`blocks.${match[1]}.attn.hook_result`)}`,
-      `head_index = ${match[2]}`,
-      "",
-      "def zero_head(result, hook):",
-      "    result = result.clone()",
-      "    result[:, :, head_index, :] = 0",
-      "    return result",
-      "",
-      "ablated_logits = model.run_with_hooks(",
-      "    tokens, fwd_hooks=[(hook_name, zero_head)]",
-      ")",
-    ] : []),
+    ...interventionLines,
     architecture ? `# ${architecture.nLayers} layers × ${architecture.nHeads} heads · ${architecture.dModel}-wide residual stream` : "# Load a model to inspect its architecture",
   ];
   return <div className="code-panel"><header><span>Equivalent code <small>(TransformerLens)</small></span><button onClick={() => void navigator.clipboard?.writeText(lines.join("\n"))}><Code2 />Copy Python</button></header><pre>{lines.map((line, index) => <div key={`${index}-${line}`}><span>{index + 1}</span><code>{line}</code></div>)}</pre></div>;
@@ -931,7 +1228,7 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
 function EvidenceEmpty({ tab, selected }: { tab: PanelTab; selected: ComponentNode | null }) {
   return <div className="evidence-empty"><div className="empty-evidence-icon">{tab === "Attention" ? <Sparkles /> : tab === "Tokens" ? <Braces /> : <Crosshair />}</div><div><h3>{tab}{selected ? ` · ${displayName(selected)}` : ""}</h3><p>Run a prompt to inspect model behavior.</p></div><button disabled><Play />Run required</button></div>;
 }
-function EvidenceLoading() { return <div className="evidence-state"><span className="spinner dark" /><p>Reading cached model evidence…</p></div>; }
+function EvidenceLoading({ message = "Reading cached model evidence…" }: { message?: string }) { return <div className="evidence-state"><span className="spinner dark" /><p>{message}</p></div>; }
 function EvidenceError({ message }: { message: string }) { return <div className="evidence-state error"><Info /><div><strong>Evidence unavailable</strong><p>{message}</p></div></div>; }
 function EvidencePrompt({ message }: { message: string }) { return <div className="evidence-prompt"><Activity /><p>{message}</p></div>; }
 
@@ -940,10 +1237,34 @@ function StatusBar({ architecture, runtime, activeRun }: { architecture: Archite
   return <footer className="status-bar"><div>{values.map(([label, value]) => <span key={label}><small>{label}:</small><code>{value}</code></span>)}</div><div><span><small>Device:</small><code>{runtime?.device || "—"}</code></span><span><small>Cache:</small><code>{formatBytes(runtime?.cacheBytes ?? 0)}</code></span><span><small>Time:</small><code>{activeRun ? `${activeRun.durationMs.toFixed(0)} ms` : "—"}</code></span><span className={`backend-state ${runtime?.backend === "ready" ? "ready" : ""}`}><i />{runtime?.backend === "ready" ? "Backend ready" : "Backend offline"}</span></div></footer>;
 }
 
-function ContextMenu(props: { menu: { x: number; y: number; node: ComponentNode }; run: RunRecord | null; onClose: () => void; onInspect: () => void; onAblate: () => void; onAction: (message: string) => void }) {
-  const { menu, run, onClose, onInspect, onAblate, onAction } = props;
+function ContextMenu(props: { menu: { x: number; y: number; node: ComponentNode }; run: RunRecord | null; canPatch: boolean; onClose: () => void; onInspect: () => void; onExpand: () => void; onAblate: () => void; onPatch: () => void; onAction: (message: string) => void }) {
+  const { menu, run, canPatch, onClose, onInspect, onExpand, onAblate, onPatch, onAction } = props;
   const action = (message: string) => { onAction(message); onClose(); };
-  return <div className="context-menu" style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 290) }} role="menu"><header><ComponentGlyph kind={menu.node.kind} /><span>{displayName(menu.node)}</span></header><button onClick={onInspect}><Eye />Inspect evidence</button><button onClick={() => action("Double-click a head to reveal Q, K, V, scores, pattern, weighted values, and result.")}><Maximize2 />Expand internals</button><button disabled={!run || menu.node.kind !== "head"} onClick={onAblate}><CircleDot />Zero ablate</button><button disabled onClick={() => action("Patching requires a source and destination run.")}><SquareDashedMousePointer />Patch…</button><hr /><button onClick={() => action("Selection saved in this workspace.")}><Save />Save selection</button></div>;
+  return <div className="context-menu" style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 290) }} role="menu"><header><ComponentGlyph kind={menu.node.kind} /><span>{displayName(menu.node)}</span></header><button onClick={onInspect}><Eye />Inspect evidence</button><button onClick={onExpand}><Maximize2 />Expand internals</button><button disabled={!run || menu.node.kind !== "head"} onClick={onAblate}><CircleDot />Zero ablate</button><button disabled={!canPatch || menu.node.kind !== "head"} onClick={onPatch}><SquareDashedMousePointer />Patch clean → corrupted</button><hr /><button onClick={() => action("Use Save Group in the inspector to name and reuse this selection.")}><Save />Save selection</button></div>;
+}
+
+function ExperimentDialog(props: {
+  cleanPrompt: string;
+  corruptedPrompt: string;
+  targetToken: string;
+  distractorToken: string;
+  setCleanPrompt: (value: string) => void;
+  setCorruptedPrompt: (value: string) => void;
+  setTargetToken: (value: string) => void;
+  setDistractorToken: (value: string) => void;
+  running: boolean;
+  loaded: boolean;
+  onClose: () => void;
+  onRun: () => void;
+}) {
+  const { cleanPrompt, corruptedPrompt, targetToken, distractorToken, setCleanPrompt, setCorruptedPrompt, setTargetToken, setDistractorToken, running, loaded, onClose, onRun } = props;
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="model-dialog experiment-dialog" role="dialog" aria-modal="true" aria-labelledby="experiment-dialog-title"><header><div><h2 id="experiment-dialog-title">Contrast experiment</h2><p>Define the clean source, corrupted destination, and the output metric used by patching and sweeps.</p></div><button aria-label="Close" onClick={onClose}><X /></button></header><div className="prompt-pair"><label><span>Clean source prompt</span><textarea value={cleanPrompt} onChange={(event) => setCleanPrompt(event.target.value)} rows={3} /></label><span className="pair-arrow">→</span><label><span>Corrupted destination prompt</span><textarea value={corruptedPrompt} onChange={(event) => setCorruptedPrompt(event.target.value)} rows={3} /></label></div><div className="metric-fields"><label><span>Target token</span><input value={targetToken} onChange={(event) => setTargetToken(event.target.value)} placeholder=" Paris" /><small>Include the leading space when the tokenizer expects one.</small></label><label><span>Distractor token <small>optional</small></span><input value={distractorToken} onChange={(event) => setDistractorToken(event.target.value)} placeholder=" Berlin" /><small>Metric = target logit − distractor logit.</small></label></div><div className="model-format-note"><Info /><p>Metric labels must each encode to exactly one model token. Token alignment is computed after both prompts run and remains visible for review.</p></div><footer><button onClick={onClose}>Cancel</button><button className="primary" disabled={running || !cleanPrompt.trim() || !corruptedPrompt.trim() || !targetToken} onClick={onRun}>{running ? <span className="spinner" /> : <FlaskConical />}{loaded ? "Run contrast" : "Load model"}</button></footer></section></div>;
+}
+
+function NameDialog({ title, description, action, onClose, onSubmit }: { title: string; description: string; action: string; onClose: () => void; onSubmit: (name: string) => void }) {
+  const [name, setName] = useState("");
+  const submit = () => { if (name.trim()) onSubmit(name.trim()); };
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="model-dialog name-dialog" role="dialog" aria-modal="true" aria-label={title}><header><div><h2>{title}</h2><p>{description}</p></div><button aria-label="Close" onClick={onClose}><X /></button></header><label><span>Name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} onKeyDown={(event) => event.key === "Enter" && submit()} /></label><footer><button onClick={onClose}>Cancel</button><button className="primary" disabled={!name.trim()} onClick={submit}><Save />{action}</button></footer></section></div>;
 }
 
 function ModelDialog({ onClose, onRegister }: { onClose: () => void; onRegister: (source: string, displayName?: string) => Promise<void> }) {
@@ -1015,6 +1336,18 @@ function usePersistentNumber(key: string, fallback: number): [number, (value: nu
   const update = (next: number) => { setValue(next); localStorage.setItem(key, String(next)); };
   return [value, update];
 }
+function usePersistentJson<T>(key: string, fallback: T): [T, (value: T | ((current: T) => T)) => void] {
+  const [value, setValue] = useState<T>(() => {
+    try { return JSON.parse(localStorage.getItem(key) ?? "null") ?? fallback; }
+    catch { return fallback; }
+  });
+  const update = (next: T | ((current: T) => T)) => setValue((current) => {
+    const resolved = typeof next === "function" ? (next as (value: T) => T)(current) : next;
+    localStorage.setItem(key, JSON.stringify(resolved));
+    return resolved;
+  });
+  return [value, update];
+}
 function isTextInput(target: EventTarget | null): boolean { return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; }
 function clamp(value: number, minimum: number, maximum: number): number { return Math.min(maximum, Math.max(minimum, value)); }
 export function calculateFitTransform(viewportWidth: number, viewportHeight: number, contentWidth: number, contentHeight: number, padding = 34): { zoom: number; x: number; y: number } {
@@ -1026,5 +1359,19 @@ export function calculateFitTransform(viewportWidth: number, viewportHeight: num
 function formatPercent(value: number): string { return `${(value * 100).toFixed(value >= .1 ? 1 : 2)}%`; }
 function formatBytes(value: number): string { if (!value) return "0 B"; const units = ["B", "KB", "MB", "GB"]; const exponent = Math.min(Math.floor(Math.log(value) / Math.log(1024)), units.length - 1); return `${(value / 1024 ** exponent).toFixed(exponent ? 1 : 0)} ${units[exponent]}`; }
 function signed(value: number): string { return `${value >= 0 ? "+" : ""}${value.toFixed(3)}`; }
+function signedCompact(value: number): string { return `${value >= 0 ? "+" : ""}${Math.abs(value) < .01 ? value.toExponential(1) : value.toFixed(2)}`; }
+function causalOverlayStyle(value: number, maximum: number): CSSProperties {
+  const strength = Math.min(Math.abs(value) / (maximum || 1), 1);
+  return {
+    "--effect-color": value >= 0 ? `rgba(70, 129, 95, ${.16 + strength * .72})` : `rgba(207, 75, 57, ${.14 + strength * .72})`,
+    "--effect-ink": strength > .58 ? "#fff" : value >= 0 ? "#205537" : "#8f2e23",
+  } as CSSProperties;
+}
+function runMethodLabel(run: RunRecord): string {
+  if (run.kind === "clean") return "Clean forward pass";
+  if (run.kind === "corrupted") return "Corrupted forward pass";
+  if (run.kind === "patched") return "Exact activation patch";
+  return run.interventions[0]?.kind === "mean_ablation" ? "Exact mean ablation" : "Exact zero ablation";
+}
 function visibleToken(value: string): string { return value.replaceAll(" ", "·").replaceAll("\n", "↵") || "∅"; }
 function shortComponentId(value: string): string { const match = value.match(/^blocks\.(\d+)\.attn\.head\.(\d+)/); return match ? `L${match[1]}H${match[2]}${value.slice(match[0].length)}` : value; }

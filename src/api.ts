@@ -2,6 +2,11 @@ import type {
   ActivationSeries,
   ArchitectureGraph,
   AttentionResult,
+  ContrastResult,
+  HeadSweepResult,
+  InterventionResult,
+  MetricResult,
+  MetricSpec,
   ModelCatalogEntry,
   ResidualStreamResult,
   RunComparison,
@@ -76,10 +81,17 @@ export class KannaadiApi {
     return this.request("/api/v1/runs");
   }
 
-  run(prompt: string, topK = 10): Promise<RunRecord> {
+  run(prompt: string, topK = 10, kind: "clean" | "corrupted" = "clean"): Promise<RunRecord> {
     return this.request("/api/v1/runs", {
       method: "POST",
-      body: JSON.stringify({ prompt, topK, seed: 0 }),
+      body: JSON.stringify({ prompt, kind, topK, seed: 0 }),
+    });
+  }
+
+  contrast(cleanPrompt: string, corruptedPrompt: string, topK = 10): Promise<ContrastResult> {
+    return this.request("/api/v1/contrasts", {
+      method: "POST",
+      body: JSON.stringify({ cleanPrompt, corruptedPrompt, topK, seed: 0 }),
     });
   }
 
@@ -87,6 +99,62 @@ export class KannaadiApi {
     return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/zero-ablate`, {
       method: "POST",
       body: JSON.stringify({ kind: "zero_ablation", componentIds, tokenScope: "all" }),
+    });
+  }
+
+  ablate(
+    runId: string,
+    componentIds: string[],
+    kind: "zero_ablation" | "mean_ablation",
+    positions: number[] | null,
+    metric?: MetricSpec,
+  ): Promise<InterventionResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/ablate`, {
+      method: "POST",
+      body: JSON.stringify({
+        kind,
+        componentIds,
+        tokenScope: positions ? "positions" : "all",
+        positions: positions ?? [],
+        metric,
+      }),
+    });
+  }
+
+  patch(
+    destinationRunId: string,
+    sourceRunId: string,
+    componentIds: string[],
+    mappings: { sourcePosition: number; destinationPosition: number }[],
+    metric?: MetricSpec,
+  ): Promise<InterventionResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(destinationRunId)}/patch`, {
+      method: "POST",
+      body: JSON.stringify({ sourceRunId, componentIds, mappings, metric }),
+    });
+  }
+
+  metric(runId: string, metric: MetricSpec): Promise<MetricResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/metric`, {
+      method: "POST",
+      body: JSON.stringify(metric),
+    });
+  }
+
+  headSweep(
+    runId: string,
+    kind: "zero_ablation" | "mean_ablation",
+    positions: number[] | null,
+    metric: MetricSpec,
+  ): Promise<HeadSweepResult> {
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/head-sweep`, {
+      method: "POST",
+      body: JSON.stringify({
+        kind,
+        tokenScope: positions ? "positions" : "all",
+        positions: positions ?? [],
+        metric,
+      }),
     });
   }
 

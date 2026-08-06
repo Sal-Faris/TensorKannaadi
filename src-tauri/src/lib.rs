@@ -1,7 +1,7 @@
 use rand::{distributions::Alphanumeric, Rng};
 use serde::Serialize;
 use std::{
-    env,
+    env, fs,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -22,6 +22,12 @@ struct SidecarInfo {
     base_url: String,
     token: String,
     state: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorkspaceEntry {
+    name: String,
 }
 
 struct ManagedSidecar {
@@ -62,6 +68,74 @@ fn sidecar_info(state: State<'_, ManagedSidecar>) -> Result<SidecarInfo, String>
         .lock()
         .map(|info| info.clone())
         .map_err(|_| "Sidecar state is unavailable".into())
+}
+
+fn safe_workspace_name(name: &str) -> Result<String, String> {
+    let value: String = name
+        .trim()
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | ' ') {
+                character
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let value = value.trim_matches([' ', '-', '_']).to_string();
+    if value.is_empty() {
+        Err("Workspace name must contain letters or numbers".into())
+    } else {
+        Ok(value.chars().take(80).collect())
+    }
+}
+
+fn workspace_directory(app: &tauri::AppHandle) -> Result<PathBuf, String> {
+    let directory = app
+        .path()
+        .app_data_dir()
+        .map_err(|error| format!("Application data directory is unavailable: {error}"))?
+        .join("workspaces");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Workspace directory could not be created: {error}"))?;
+    Ok(directory)
+}
+
+#[tauri::command]
+fn save_workspace(
+    app: tauri::AppHandle,
+    name: String,
+    contents: String,
+) -> Result<WorkspaceEntry, String> {
+    let name = safe_workspace_name(&name)?;
+    let path = workspace_directory(&app)?.join(format!("{name}.json"));
+    fs::write(&path, contents).map_err(|error| format!("Workspace could not be saved: {error}"))?;
+    Ok(WorkspaceEntry { name })
+}
+
+#[tauri::command]
+fn list_workspaces(app: tauri::AppHandle) -> Result<Vec<WorkspaceEntry>, String> {
+    let mut entries = Vec::new();
+    for item in fs::read_dir(workspace_directory(&app)?)
+        .map_err(|error| format!("Workspaces could not be listed: {error}"))?
+    {
+        let item = item.map_err(|error| format!("A workspace entry could not be read: {error}"))?;
+        let path = item.path();
+        if path.extension().and_then(|value| value.to_str()) == Some("json") {
+            if let Some(name) = path.file_stem().and_then(|value| value.to_str()) {
+                entries.push(WorkspaceEntry { name: name.into() });
+            }
+        }
+    }
+    entries.sort_by_key(|entry| entry.name.to_lowercase());
+    Ok(entries)
+}
+
+#[tauri::command]
+fn load_workspace(app: tauri::AppHandle, name: String) -> Result<String, String> {
+    let name = safe_workspace_name(&name)?;
+    let path = workspace_directory(&app)?.join(format!("{name}.json"));
+    fs::read_to_string(path).map_err(|error| format!("Workspace could not be opened: {error}"))
 }
 
 fn backend_directory() -> PathBuf {
@@ -207,7 +281,12 @@ fn start_sidecar(app: tauri::AppHandle) -> Result<(), String> {
 pub fn run() {
     let app = tauri::Builder::default()
         .manage(ManagedSidecar::new())
-        .invoke_handler(tauri::generate_handler![sidecar_info])
+        .invoke_handler(tauri::generate_handler![
+            sidecar_info,
+            save_workspace,
+            list_workspaces,
+            load_workspace
+        ])
         .setup(|app| {
             if let Err(error) = start_sidecar(app.handle().clone()) {
                 if let Ok(mut info) = app.state::<ManagedSidecar>().info.lock() {

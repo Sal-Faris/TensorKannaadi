@@ -4,7 +4,16 @@ from fastapi.testclient import TestClient
 
 from kannaadi.adapters import TransformerLensAdapter
 from kannaadi.api.app import RuntimeState, app
-from kannaadi.domain import Prediction, RunRecord, ModelSpec, TokenRecord
+from kannaadi.domain import (
+    AlignmentPair,
+    ContrastResult,
+    InterventionResult,
+    ModelSpec,
+    Prediction,
+    RunRecord,
+    TokenAlignment,
+    TokenRecord,
+)
 
 
 client = TestClient(app)
@@ -23,16 +32,22 @@ class LoadedAdapter:
 
 
 def run_record(kind="clean", parent=None):
+    run_id = {
+        "clean": "run_test",
+        "corrupted": "run_corrupted",
+        "intervened": "run_ablation",
+        "patched": "run_patch",
+    }[kind]
     return RunRecord(
-        id="run_test" if kind == "clean" else "run_ablation",
+        id=run_id,
         kind=kind,
-        label="Clean run" if kind == "clean" else "Ablate L1H2",
+        label={"clean": "Clean run", "corrupted": "Corrupted run", "intervened": "Ablate L1H2", "patched": "Patch L1H2"}[kind],
         modelId="gpt2-small",
-        prompt="The capital of France is",
+        prompt="The capital of Germany is" if kind in {"corrupted", "patched"} else "The capital of France is",
         tokens=[TokenRecord(position=0, tokenId=1, text="The", display="The")],
         topPredictions=[Prediction(tokenId=2, text=" Paris", display="·Paris", logit=4.2, probability=.42)],
         requestedActivations=["blocks.1.attn.hook_pattern"],
-        interventions=[] if kind == "clean" else [{"componentIds": ["blocks.1.attn.head.2"], "tokenScope": "all"}],
+        interventions=[] if kind in {"clean", "corrupted"} else [{"kind": "zero_ablation", "componentIds": ["blocks.1.attn.head.2"], "tokenScope": "all"}],
         parentRunId=parent,
         device="cpu",
         dtype="torch.float32",
@@ -51,17 +66,38 @@ class ExperimentStub:
     def list_runs(self):
         return [self.clean]
 
-    def run_clean(self, prompt, *, top_k=10, seed=0):
+    def run_prompt(self, prompt, *, kind="clean", label=None, top_k=10, seed=0):
         assert prompt == "The capital of France is"
+        assert kind == "clean"
+        assert label is None
         assert top_k == 7
         assert seed == 3
         return self.clean
 
-    def zero_ablate(self, run_id, component_ids, *, token_scope="all"):
+    def zero_ablate(self, run_id, component_ids, *, token_scope="all", positions=None):
         assert run_id == "run_test"
         assert component_ids == ["blocks.1.attn.head.2"]
         assert token_scope == "all"
+        assert positions == []
         return run_record("intervened", "run_test")
+
+    def run_contrast(self, clean_prompt, corrupted_prompt, *, top_k=10, seed=0):
+        assert clean_prompt == "The capital of France is"
+        assert corrupted_prompt == "The capital of Germany is"
+        alignment = TokenAlignment(
+            sourceRunId="run_test",
+            destinationRunId="run_corrupted",
+            pairs=[AlignmentPair(sourcePosition=0, destinationPosition=0, sourceToken="The", destinationToken="The", status="exact")],
+            exactMatches=1,
+            sourceLength=1,
+            destinationLength=1,
+        )
+        return ContrastResult(id="contrast_test", cleanRun=self.clean, corruptedRun=run_record("corrupted"), alignment=alignment)
+
+    def ablate(self, run_id, component_ids, **kwargs):
+        assert kwargs["kind"] == "mean_ablation"
+        assert kwargs["positions"] == [0]
+        return InterventionResult(run=run_record("intervened", run_id))
 
 
 @pytest.fixture(autouse=True)
@@ -146,3 +182,28 @@ def test_prompt_and_zero_ablation_endpoints_return_immutable_run_manifests() -> 
     assert ablated.status_code == 200
     assert ablated.json()["kind"] == "intervened"
     assert ablated.json()["parentRunId"] == "run_test"
+
+
+def test_contrast_and_position_scoped_mean_ablation_are_first_class_workflows() -> None:
+    app.state.runtime.adapter = LoadedAdapter()
+    app.state.runtime.experiments = ExperimentStub()
+    contrast = client.post(
+        "/api/v1/contrasts",
+        json={"cleanPrompt": "The capital of France is", "corruptedPrompt": "The capital of Germany is"},
+    )
+    assert contrast.status_code == 200
+    assert contrast.json()["cleanRun"]["kind"] == "clean"
+    assert contrast.json()["corruptedRun"]["kind"] == "corrupted"
+    assert contrast.json()["alignment"]["strategy"] == "minimum_edit_distance"
+
+    ablated = client.post(
+        "/api/v1/runs/run_test/ablate",
+        json={
+            "kind": "mean_ablation",
+            "componentIds": ["blocks.1.attn.head.2"],
+            "tokenScope": "positions",
+            "positions": [0],
+        },
+    )
+    assert ablated.status_code == 200
+    assert ablated.json()["run"]["kind"] == "intervened"

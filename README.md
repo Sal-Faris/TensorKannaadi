@@ -4,7 +4,7 @@ Kannaadi is a desktop-first visual workbench for mechanistic interpretability. I
 
 ## Current milestone
 
-Version 0.3 completes the first end-to-end scientific workflow: load a real model, execute a prompt, inspect a head's real attention pattern, zero-ablate it, compare the resulting output distribution, and view equivalent TransformerLens code.
+Version 0.4 adds a practical causal-research workflow on top of the real-model foundation: define a clean/corrupted contrast, review tokenizer alignment, choose an explicit logit metric, patch or ablate selected heads at chosen token positions, and sweep every head in the model.
 
 - Native Windows window with desktop-owned sidecar startup and shutdown
 - Loopback-only FastAPI service on a reserved per-launch port
@@ -16,8 +16,15 @@ Version 0.3 completes the first end-to-end scientific workflow: load a real mode
 - Real tokenization, immutable run manifests, top next-token predictions, and server-side activation caches
 - Real attention-pattern and QK-score heatmaps for any selected cached head
 - Per-token activation magnitudes and a residual-stream logit lens
-- Exact all-token zero ablation through `hook_result`, with clean/intervened probability and logit comparisons
-- Generated TransformerLens Python for the current prompt, selected head, and intervention
+- Clean-source and corrupted-destination prompt pairs with deterministic minimum-edit token alignment
+- Explicit target-logit or target-minus-distractor logit metrics with strict single-token validation
+- Exact zero ablation and within-prompt mean ablation through `hook_result`, at all or selected token positions
+- Exact clean-to-corrupted activation patching with persisted source/destination token mappings
+- Vectorized whole-model head sweeps: one batched forward pass per layer rather than one pass per head
+- Diverging causal-effect overlays on expanded heads and a complete layer-by-head sweep heatmap
+- Named component groups for repeatable multi-head interventions
+- Native workspace snapshots for prompts, metric setup, selections, groups, expanded components, and panel layout
+- Generated TransformerLens Python for zero ablation, mean ablation, and activation patching
 - Geometry-based Fit all, 5–200% zoom, trackpad pinch zoom, two-finger panning, and resizable persisted panels
 - Registration of another TransformerLens model name or compatible local Hugging Face-format directory
 
@@ -101,9 +108,10 @@ The frontend consumes normalized domain objects and does not infer architecture 
 
 ## Known scope boundaries
 
-- Interactive caches are currently limited to 512 prompt tokens and live in memory for the current desktop session.
-- Zero ablation currently targets attention-head results at all token positions. Mean/resample ablation, position scopes, corrupted runs, and activation patching are the next causal workflow.
+- Interactive tensors are currently limited to 512 prompt tokens and live in memory for the current desktop session. Workspace metadata persists, while run tensors are deliberately recomputed after restart.
+- Current causal interventions target attention-head results. MLP/neuron patching, path patching, gradients, attribution patching, and dataset-scale statistics remain future workflows.
 - The normalized architecture renderer currently targets TransformerLens-compatible decoder-only models with attention/MLP blocks. Unsupported or unusual architectures may load in TransformerLens but still need a dedicated Kannaadi architecture adapter.
 - Model registration accepts TransformerLens identifiers and compatible local Hugging Face directories; a standalone weight file cannot describe enough topology to load safely.
 - TransformerLens 3.x is introducing `TransformerBridge`. Kannaadi keeps backend-specific behavior behind one adapter so the loading path can migrate without changing experiment manifests or the frontend.
-- Runs and panel layout are local. Durable workspace snapshots, datasets, patching, gradients, custom-script execution, and plugins remain future milestones.
+- Arbitrary custom-script execution is not enabled yet; generated TransformerLens code remains read-only so the desktop app does not silently execute untrusted Python. A future trusted/restricted code workflow should make that boundary explicit.
+- Dataset runners, resumable background jobs, experiment export bundles, plugins, installer signing, and unusual non-decoder architecture renderers remain future milestones.
