@@ -64,6 +64,7 @@ export type RuntimeStatus = {
   transformerLensAvailable: boolean;
   cudaAvailable: boolean;
   device: string;
+  dtype: string | null;
   loadedModelId: string | null;
   loadedModelName: string | null;
   loadState: "idle" | "loading" | "loaded" | "error";

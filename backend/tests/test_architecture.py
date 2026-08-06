@@ -1,3 +1,6 @@
+import sys
+from types import ModuleType, SimpleNamespace
+
 import pytest
 from pydantic import ValidationError
 
@@ -37,3 +40,47 @@ def test_graph_rejects_head_count_mismatch() -> None:
 def test_head_requires_coordinates() -> None:
     with pytest.raises(ValidationError, match="indices"):
         ComponentNode(id="bad", label="Bad head", kind="head")
+
+
+@pytest.mark.parametrize(
+    ("dtype", "expected_loader"),
+    [("float32", "processed"), ("bfloat16", "no_processing")],
+)
+def test_adapter_uses_memory_efficient_loader_for_reduced_precision(
+    monkeypatch: pytest.MonkeyPatch, dtype: str, expected_loader: str
+) -> None:
+    calls: list[str] = []
+    fake_torch = ModuleType("torch")
+    fake_torch.float16 = "float16"
+    fake_torch.bfloat16 = "bfloat16"
+    fake_torch.float32 = "float32"
+    fake_torch.float64 = "float64"
+
+    class FakeHookedTransformer:
+        @classmethod
+        def from_pretrained(cls, *_args, **_kwargs):
+            calls.append("processed")
+            return SimpleNamespace(set_use_attn_result=lambda _enabled: None)
+
+        @classmethod
+        def from_pretrained_no_processing(cls, *_args, **_kwargs):
+            calls.append("no_processing")
+            return SimpleNamespace(set_use_attn_result=lambda _enabled: None)
+
+    fake_transformer_lens = ModuleType("transformer_lens")
+    fake_transformer_lens.HookedTransformer = FakeHookedTransformer
+    monkeypatch.setitem(sys.modules, "torch", fake_torch)
+    monkeypatch.setitem(sys.modules, "transformer_lens", fake_transformer_lens)
+
+    adapter = TransformerLensAdapter()
+    adapter.load(
+        ModelSpec(
+            id="test",
+            display_name="Test model",
+            backend="transformer_lens",
+            repository="test",
+            dtype=dtype,
+        )
+    )
+
+    assert calls == [expected_loader]

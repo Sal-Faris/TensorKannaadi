@@ -1,6 +1,6 @@
 [package]
 name = "kannaadi"
-version = "0.4.0"
+version = "0.4.1"
 description = "Desktop shell for the Kannaadi research workbench"
 authors = ["Sal-Faris"]
 edition = "2021"

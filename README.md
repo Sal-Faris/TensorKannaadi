@@ -4,12 +4,13 @@ Kannaadi is a desktop-first visual workbench for mechanistic interpretability. I
 
 ## Current milestone
 
-Version 0.4 adds a practical causal-research workflow on top of the real-model foundation: define a clean/corrupted contrast, review tokenizer alignment, choose an explicit logit metric, patch or ablate selected heads at chosen token positions, and sweep every head in the model.
+Version 0.4.1 adds a low-memory desktop loading path to the 0.4 causal-research workflow: define a clean/corrupted contrast, review tokenizer alignment, choose an explicit logit metric, patch or ablate selected heads at chosen token positions, and sweep every head in the model.
 
 - Native Windows window with desktop-owned sidecar startup and shutdown
 - Loopback-only FastAPI service on a reserved per-launch port
 - Per-launch bearer token passed directly from the native process to the webview
 - Real TransformerLens model loading; production UI never falls back to invented architecture data
+- Memory-efficient CPU loading with bfloat16, TransformerLens' centered-unembedding logit gauge, and explicit runtime precision
 - Canonical component identities such as `blocks.5.attn.head.3`
 - Token and positional embeddings, residual stream, normalization, attention heads, MLPs, final normalization, and unembedding represented from the loaded model configuration
 - Progressive component disclosure, including Q/K/V, attention scores, softmax patterns, weighted values, projected results, and MLP internals

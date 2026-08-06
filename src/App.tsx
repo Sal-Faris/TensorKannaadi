@@ -316,6 +316,7 @@ export function App() {
           setDistractorToken(snapshot.distractorToken);
           chooseModel(snapshot.modelId);
         }}
+        loading={loading}
         running={running}
         connectionError={connectionError}
       />
@@ -405,10 +406,11 @@ function Workbench(props: {
   distractorToken: string;
   corruptedPrompt: string;
   onRestoreWorkspace: (snapshot: WorkspaceSnapshot) => void;
+  loading: boolean;
   running: boolean;
   connectionError: string | null;
 }) {
-  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, causalAblate, patchActivations, contrast, effects, targetToken, distractorToken, corruptedPrompt, onRestoreWorkspace, running, connectionError } = props;
+  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, causalAblate, patchActivations, contrast, effects, targetToken, distractorToken, corruptedPrompt, onRestoreWorkspace, loading, running, connectionError } = props;
   const [selection, setSelection] = useState<string[]>([]);
   const [past, setPast] = useState<string[][]>([]);
   const [future, setFuture] = useState<string[][]>([]);
@@ -671,6 +673,8 @@ function Workbench(props: {
           <ArchitecturePanel
             architecture={architecture}
             error={connectionError}
+            connected={runtime?.backend === "ready"}
+            loading={loading}
             selection={selection}
             expanded={expanded}
             setExpanded={setExpanded}
@@ -791,6 +795,8 @@ function SidebarSection({ title, icon, children }: { title: string; icon: ReactN
 function ArchitecturePanel(props: {
   architecture: ArchitectureGraph | null;
   error: string | null;
+  connected: boolean;
+  loading: boolean;
   selection: string[];
   expanded: Set<number>;
   setExpanded: (value: Set<number>) => void;
@@ -811,7 +817,7 @@ function ArchitecturePanel(props: {
   canUndo: boolean;
   canRedo: boolean;
 }) {
-  const { architecture, error, selection, expanded, setExpanded, expandedHeads, setExpandedHeads, selectNode, contextNode, tool, setTool, zoom, setZoom, pan, setPan, commitSelection, overlay } = props;
+  const { architecture, error, connected, loading, selection, expanded, setExpanded, expandedHeads, setExpandedHeads, selectNode, contextNode, tool, setTool, zoom, setZoom, pan, setPan, commitSelection, overlay } = props;
   const viewport = useRef<HTMLDivElement>(null);
   const content = useRef<HTMLDivElement>(null);
   const zoomRef = useRef(zoom);
@@ -925,7 +931,7 @@ function ArchitecturePanel(props: {
         </div>
       </div>
       <div ref={viewport} className={`canvas-viewport tool-${tool}`} onPointerDown={pointerDown} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={pointerUp}>
-        {!architecture ? <CanvasEmpty error={error} /> : (
+        {!architecture ? <CanvasEmpty error={error} connected={connected} loading={loading} /> : (
           <div ref={content} className={`architecture-content semantic-${zoom < .25 ? "far" : zoom < .55 ? "mid" : "near"}`} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
             <ModelBoundaryRow mode="output" architecture={architecture} selection={selection} selectNode={selectNode} />
             <div className="column-labels"><span>Layer</span><span>Residual Stream</span><span>Attention</span><span>MLP</span><span>Residual Stream</span></div>
@@ -1002,8 +1008,22 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
   );
 }
 
-function CanvasEmpty({ error }: { error: string | null }) {
-  return <div className="canvas-empty"><div className="empty-orbit"><KannaadiLogo /></div><h2>{error ? "Desktop service is not connected" : "Load a model to reveal its architecture"}</h2><p>{error ? "Launch Kannaadi through its desktop entry point, or start the Python service for browser development." : "The architecture will be built from the loaded model configuration."}</p>{error && <code>{error}</code>}</div>;
+function CanvasEmpty({ error, connected, loading }: { error: string | null; connected: boolean; loading: boolean }) {
+  const heading = loading
+    ? "Loading the model locally"
+    : error && !connected
+      ? "Desktop service is not connected"
+      : error
+        ? "Model could not be loaded"
+        : "Load a model to reveal its architecture";
+  const detail = loading
+    ? "TransformerLens is materializing the weights. A first load can take a few minutes on a CPU; keep Kannaadi open."
+    : error && !connected
+      ? "Launch Kannaadi through its desktop entry point, or start the Python service for browser development."
+      : error
+        ? "The desktop service is still available. Review the model-loading error below, then retry or choose a smaller model."
+        : "The architecture will be built from the loaded model configuration.";
+  return <div className="canvas-empty"><div className="empty-orbit"><KannaadiLogo /></div><h2>{heading}</h2><p>{detail}</p>{error && <code>{error}</code>}</div>;
 }
 
 function Inspector(props: {
@@ -1171,6 +1191,13 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
   const match = component?.match(/^blocks\.(\d+)\.attn\.head\.(\d+)$/);
   const hookName = match ? `blocks.${match[1]}.attn.hook_result` : null;
   const positions = intervention?.tokenScope === "positions" ? intervention.positions : run?.tokens.map((token) => token.position) ?? [];
+  const reducedDtype = run?.dtype.match(/(bfloat16|float16)$/)?.[1];
+  const modelLoadLines = reducedDtype ? [
+    `model = HookedTransformer.from_pretrained_no_processing(${JSON.stringify(model.repository)}, device=${JSON.stringify(run?.device ?? "cpu")}, dtype=torch.${reducedDtype})`,
+    "with torch.no_grad():",
+    "    mean_unembed = model.W_U.mean(dim=-1, keepdim=True, dtype=torch.float32)",
+    "    model.W_U.sub_(mean_unembed.to(model.W_U.dtype))",
+  ] : [`model = HookedTransformer.from_pretrained(${JSON.stringify(model.repository)})`];
   const interventionLines = !match || !intervention ? [] : intervention.kind === "activation_patch" ? [
     "",
     `source_prompt = ${JSON.stringify(prompt)}`,
@@ -1211,7 +1238,7 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
     "from transformer_lens import HookedTransformer",
     "import torch",
     "",
-    `model = HookedTransformer.from_pretrained(${JSON.stringify(model.repository)})`,
+    ...modelLoadLines,
     "model.set_use_attn_result(True)",
     `prompt = ${JSON.stringify(prompt)}`,
     "tokens = model.to_tokens(prompt)",
@@ -1234,7 +1261,7 @@ function EvidencePrompt({ message }: { message: string }) { return <div classNam
 
 function StatusBar({ architecture, runtime, activeRun }: { architecture: ArchitectureGraph | null; runtime: RuntimeStatus | null; activeRun: RunRecord | null }) {
   const values = architecture ? [["Model", architecture.modelId], ["Layers", architecture.nLayers], ["Heads", architecture.nHeads], ["d_model", architecture.dModel], ["d_head", architecture.dHead], ["Vocab", architecture.vocabularySize]] : [["Model", "not loaded"]];
-  return <footer className="status-bar"><div>{values.map(([label, value]) => <span key={label}><small>{label}:</small><code>{value}</code></span>)}</div><div><span><small>Device:</small><code>{runtime?.device || "—"}</code></span><span><small>Cache:</small><code>{formatBytes(runtime?.cacheBytes ?? 0)}</code></span><span><small>Time:</small><code>{activeRun ? `${activeRun.durationMs.toFixed(0)} ms` : "—"}</code></span><span className={`backend-state ${runtime?.backend === "ready" ? "ready" : ""}`}><i />{runtime?.backend === "ready" ? "Backend ready" : "Backend offline"}</span></div></footer>;
+  return <footer className="status-bar"><div>{values.map(([label, value]) => <span key={label}><small>{label}:</small><code>{value}</code></span>)}</div><div><span><small>Device:</small><code>{runtime?.device || "—"}</code></span><span><small>Precision:</small><code>{runtime?.dtype || "—"}</code></span><span><small>Cache:</small><code>{formatBytes(runtime?.cacheBytes ?? 0)}</code></span><span><small>Time:</small><code>{activeRun ? `${activeRun.durationMs.toFixed(0)} ms` : "—"}</code></span><span className={`backend-state ${runtime?.backend === "ready" ? "ready" : ""}`}><i />{runtime?.backend === "ready" ? "Backend ready" : "Backend offline"}</span></div></footer>;
 }
 
 function ContextMenu(props: { menu: { x: number; y: number; node: ComponentNode }; run: RunRecord | null; canPatch: boolean; onClose: () => void; onInspect: () => void; onExpand: () => void; onAblate: () => void; onPatch: () => void; onAction: (message: string) => void }) {

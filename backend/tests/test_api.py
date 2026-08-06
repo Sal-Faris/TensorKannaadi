@@ -115,6 +115,27 @@ def test_architecture_requires_a_real_loaded_model() -> None:
     assert "not loaded" in response.json()["detail"]
 
 
+def test_cpu_model_load_defaults_to_memory_efficient_bfloat16(monkeypatch) -> None:
+    captured: dict[str, ModelSpec] = {}
+
+    def fake_load(runtime, spec: ModelSpec):
+        captured["spec"] = spec
+        runtime.loaded_model_id = spec.id
+        runtime.loaded_model_name = spec.display_name
+        runtime.device = spec.device
+        runtime.dtype = spec.dtype
+        runtime.load_state = "loaded"
+        return graph()
+
+    monkeypatch.setattr(RuntimeState, "load", fake_load)
+    response = client.post("/api/v1/models/gpt2-small/load", json={"device": "cpu"})
+
+    assert response.status_code == 200
+    assert captured["spec"].dtype == "bfloat16"
+    status = client.get("/api/v1/status").json()
+    assert status["dtype"] == "bfloat16"
+
+
 def test_architecture_endpoint_returns_loaded_adapter_graph() -> None:
     app.state.runtime.adapter = LoadedAdapter()
     app.state.runtime.loaded_model_id = "gpt2-small"
