@@ -104,14 +104,19 @@ export type Prediction = {
 };
 
 export type InterventionSpec = {
-  kind: "zero_ablation";
+  kind: "zero_ablation" | "mean_ablation" | "activation_patch";
   componentIds: string[];
-  tokenScope: "all";
+  tokenScope: "all" | "positions";
+  positions: number[];
+  sourceRunId: string | null;
+  destinationRunId: string | null;
+  patchMappings: { sourcePosition: number; destinationPosition: number }[];
+  baseline: string | null;
 };
 
 export type RunRecord = {
   id: string;
-  kind: "clean" | "intervened";
+  kind: "clean" | "corrupted" | "intervened" | "patched";
   label: string;
   status: "complete";
   modelId: string;
@@ -193,4 +198,98 @@ export type RunComparison = {
   baselineTopTokenDelta: number;
   klDivergence: number;
   tokens: TokenComparison[];
+};
+
+export type AlignmentPair = {
+  sourcePosition: number | null;
+  destinationPosition: number | null;
+  sourceToken: string | null;
+  destinationToken: string | null;
+  status: "exact" | "substitution" | "source_gap" | "destination_gap";
+};
+
+export type TokenAlignment = {
+  sourceRunId: string;
+  destinationRunId: string;
+  strategy: "minimum_edit_distance";
+  pairs: AlignmentPair[];
+  exactMatches: number;
+  sourceLength: number;
+  destinationLength: number;
+};
+
+export type ContrastResult = {
+  id: string;
+  cleanRun: RunRecord;
+  corruptedRun: RunRecord;
+  alignment: TokenAlignment;
+};
+
+export type MetricSpec = {
+  targetToken: string;
+  distractorToken?: string;
+  position: number;
+};
+
+export type MetricResult = {
+  runId: string;
+  metric: "target_logit" | "logit_difference";
+  position: number;
+  targetTokenId: number;
+  targetToken: string;
+  distractorTokenId: number | null;
+  distractorToken: string | null;
+  value: number;
+};
+
+export type CausalEffect = {
+  baseline: MetricResult;
+  intervened: MetricResult;
+  delta: number;
+};
+
+export type InterventionResult = {
+  run: RunRecord;
+  effect: CausalEffect | null;
+};
+
+export type HeadEffect = {
+  componentId: string;
+  layer: number;
+  head: number;
+  metricValue: number;
+  delta: number;
+};
+
+export type HeadSweepResult = {
+  runId: string;
+  kind: "zero_ablation" | "mean_ablation";
+  metric: MetricResult;
+  effects: HeadEffect[];
+  minimum: number;
+  maximum: number;
+  durationMs: number;
+};
+
+export type ComponentGroup = {
+  id: string;
+  name: string;
+  componentIds: string[];
+};
+
+export type WorkspaceSnapshot = {
+  format: "kannaadi-workspace";
+  version: 1;
+  name: string;
+  savedAt: string;
+  modelId: string;
+  prompt: string;
+  corruptedPrompt: string;
+  targetToken: string;
+  distractorToken: string;
+  selection: string[];
+  groups: ComponentGroup[];
+  expandedLayers: number[];
+  expandedHeads: string[];
+  layout: { leftWidth: number; rightWidth: number; bottomHeight: number };
 };

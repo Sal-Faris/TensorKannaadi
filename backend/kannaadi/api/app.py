@@ -15,15 +15,25 @@ from starlette.responses import JSONResponse
 
 from kannaadi.adapters import TransformerLensAdapter
 from kannaadi.domain import (
+    AblationRequest,
     ActivationSeries,
     ArchitectureGraph,
     AttentionResult,
+    ContrastRequest,
+    ContrastResult,
+    HeadSweepRequest,
+    HeadSweepResult,
+    InterventionResult,
     InterventionSpec,
+    MetricResult,
+    MetricSpec,
     ModelSpec,
+    PatchRequest,
     ResidualStreamResult,
     RunComparison,
     RunRecord,
     RunRequest,
+    TokenAlignment,
 )
 from kannaadi.experiments import ExperimentEngine
 
@@ -94,7 +104,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.3.0")
+app = FastAPI(title="Kannaadi API", version="0.4.0")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -253,7 +263,29 @@ def list_runs(request: Request) -> list[RunRecord]:
 async def create_run(payload: RunRequest, request: Request) -> RunRecord:
     engine = experiment_engine(request)
     try:
-        return await run_in_threadpool(engine.run_clean, payload.prompt, top_k=payload.top_k, seed=payload.seed)
+        return await run_in_threadpool(
+            engine.run_prompt,
+            payload.prompt,
+            kind=payload.kind,
+            label=payload.label,
+            top_k=payload.top_k,
+            seed=payload.seed,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post("/api/v1/contrasts", response_model=ContrastResult, response_model_by_alias=True)
+async def create_contrast(payload: ContrastRequest, request: Request) -> ContrastResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.run_contrast,
+            payload.clean_prompt,
+            payload.corrupted_prompt,
+            top_k=payload.top_k,
+            seed=payload.seed,
+        )
     except Exception as exc:
         raise run_error(exc) from exc
 
@@ -275,6 +307,92 @@ async def zero_ablate(run_id: str, payload: InterventionSpec, request: Request) 
             run_id,
             payload.component_ids,
             token_scope=payload.token_scope,
+            positions=payload.positions,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/ablate",
+    response_model=InterventionResult,
+    response_model_by_alias=True,
+)
+async def ablate(run_id: str, payload: AblationRequest, request: Request) -> InterventionResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.ablate,
+            run_id,
+            payload.component_ids,
+            kind=payload.kind,
+            token_scope=payload.token_scope,
+            positions=payload.positions,
+            metric=payload.metric,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{destination_run_id}/patch",
+    response_model=InterventionResult,
+    response_model_by_alias=True,
+)
+async def patch(destination_run_id: str, payload: PatchRequest, request: Request) -> InterventionResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.patch,
+            destination_run_id,
+            payload.source_run_id,
+            payload.component_ids,
+            mappings=payload.mappings,
+            metric=payload.metric,
+        )
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.get(
+    "/api/v1/runs/{source_run_id}/align/{destination_run_id}",
+    response_model=TokenAlignment,
+    response_model_by_alias=True,
+)
+def align_runs(source_run_id: str, destination_run_id: str, request: Request) -> TokenAlignment:
+    try:
+        return experiment_engine(request).align_runs(source_run_id, destination_run_id)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/metric",
+    response_model=MetricResult,
+    response_model_by_alias=True,
+)
+def run_metric(run_id: str, payload: MetricSpec, request: Request) -> MetricResult:
+    try:
+        return experiment_engine(request).metric(run_id, payload)
+    except Exception as exc:
+        raise run_error(exc) from exc
+
+
+@app.post(
+    "/api/v1/runs/{run_id}/head-sweep",
+    response_model=HeadSweepResult,
+    response_model_by_alias=True,
+)
+async def head_sweep(run_id: str, payload: HeadSweepRequest, request: Request) -> HeadSweepResult:
+    engine = experiment_engine(request)
+    try:
+        return await run_in_threadpool(
+            engine.head_sweep,
+            run_id,
+            kind=payload.kind,
+            token_scope=payload.token_scope,
+            positions=payload.positions,
+            metric=payload.metric,
         )
     except Exception as exc:
         raise run_error(exc) from exc

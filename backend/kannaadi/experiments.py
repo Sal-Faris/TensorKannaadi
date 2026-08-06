@@ -6,20 +6,30 @@ from datetime import datetime, timezone
 import re
 import threading
 import time
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 from uuid import uuid4
 
 from kannaadi.domain import (
     ActivationSeries,
+    AlignmentPair,
     ArchitectureGraph,
     AttentionResult,
+    CausalEffect,
     ComponentNode,
+    ContrastResult,
+    HeadEffect,
+    HeadSweepResult,
+    InterventionResult,
     InterventionSpec,
+    MetricResult,
+    MetricSpec,
+    PatchMapping,
     Prediction,
     ResidualPoint,
     ResidualStreamResult,
     RunComparison,
     RunRecord,
+    TokenAlignment,
     TokenComparison,
     TokenRecord,
 )
@@ -80,7 +90,15 @@ class ExperimentEngine:
     def get_run(self, run_id: str) -> RunRecord:
         return self._artifacts(run_id).record
 
-    def run_clean(self, prompt: str, *, top_k: int = 10, seed: int = 0) -> RunRecord:
+    def run_prompt(
+        self,
+        prompt: str,
+        *,
+        kind: Literal["clean", "corrupted"] = "clean",
+        label: str | None = None,
+        top_k: int = 10,
+        seed: int = 0,
+    ) -> RunRecord:
         with self._lock:
             tokens = self.adapter.tokenize([prompt])
             if int(tokens.shape[-1]) > self.max_prompt_tokens:
@@ -90,55 +108,165 @@ class ExperimentEngine:
             return self._execute(
                 tokens=tokens,
                 prompt=prompt,
-                kind="clean",
-                label="Clean run",
+                kind=kind,
+                label=label or ("Clean run" if kind == "clean" else "Corrupted run"),
                 interventions=[],
                 parent_run_id=None,
                 top_k=top_k,
                 seed=seed,
             ).record
 
-    def zero_ablate(
+    def run_clean(self, prompt: str, *, top_k: int = 10, seed: int = 0) -> RunRecord:
+        return self.run_prompt(prompt, kind="clean", top_k=top_k, seed=seed)
+
+    def run_contrast(self, clean_prompt: str, corrupted_prompt: str, *, top_k: int = 10, seed: int = 0) -> ContrastResult:
+        with self._lock:
+            clean = self.run_prompt(clean_prompt, kind="clean", label="Clean source", top_k=top_k, seed=seed)
+            corrupted = self.run_prompt(
+                corrupted_prompt,
+                kind="corrupted",
+                label="Corrupted destination",
+                top_k=top_k,
+                seed=seed,
+            )
+            return ContrastResult(
+                id=f"contrast_{uuid4().hex[:12]}",
+                cleanRun=clean,
+                corruptedRun=corrupted,
+                alignment=self.align_runs(clean.id, corrupted.id),
+            )
+
+    def align_runs(self, source_run_id: str, destination_run_id: str) -> TokenAlignment:
+        source = self._artifacts(source_run_id).record
+        destination = self._artifacts(destination_run_id).record
+        pairs = self.minimum_edit_alignment(source.tokens, destination.tokens)
+        return TokenAlignment(
+            sourceRunId=source_run_id,
+            destinationRunId=destination_run_id,
+            pairs=pairs,
+            exactMatches=sum(pair.status == "exact" for pair in pairs),
+            sourceLength=len(source.tokens),
+            destinationLength=len(destination.tokens),
+        )
+
+    @staticmethod
+    def minimum_edit_alignment(source: list[TokenRecord], destination: list[TokenRecord]) -> list[AlignmentPair]:
+        """Align tokenizer output with deterministic minimum edit distance."""
+        rows, columns = len(source), len(destination)
+        cost = [[0] * (columns + 1) for _ in range(rows + 1)]
+        for row in range(rows + 1):
+            cost[row][0] = row
+        for column in range(columns + 1):
+            cost[0][column] = column
+        for row in range(1, rows + 1):
+            for column in range(1, columns + 1):
+                substitution = 0 if source[row - 1].token_id == destination[column - 1].token_id else 1
+                cost[row][column] = min(
+                    cost[row - 1][column] + 1,
+                    cost[row][column - 1] + 1,
+                    cost[row - 1][column - 1] + substitution,
+                )
+
+        aligned: list[AlignmentPair] = []
+        row, column = rows, columns
+        while row or column:
+            if row and column:
+                substitution = 0 if source[row - 1].token_id == destination[column - 1].token_id else 1
+                if cost[row][column] == cost[row - 1][column - 1] + substitution:
+                    source_token = source[row - 1]
+                    destination_token = destination[column - 1]
+                    aligned.append(
+                        AlignmentPair(
+                            sourcePosition=source_token.position,
+                            destinationPosition=destination_token.position,
+                            sourceToken=source_token.display,
+                            destinationToken=destination_token.display,
+                            status="exact" if substitution == 0 else "substitution",
+                        )
+                    )
+                    row -= 1
+                    column -= 1
+                    continue
+            if row and cost[row][column] == cost[row - 1][column] + 1:
+                source_token = source[row - 1]
+                aligned.append(
+                    AlignmentPair(
+                        sourcePosition=source_token.position,
+                        destinationPosition=None,
+                        sourceToken=source_token.display,
+                        destinationToken=None,
+                        status="destination_gap",
+                    )
+                )
+                row -= 1
+            else:
+                destination_token = destination[column - 1]
+                aligned.append(
+                    AlignmentPair(
+                        sourcePosition=None,
+                        destinationPosition=destination_token.position,
+                        sourceToken=None,
+                        destinationToken=destination_token.display,
+                        status="source_gap",
+                    )
+                )
+                column -= 1
+        aligned.reverse()
+        return aligned
+
+    def ablate(
         self,
         baseline_run_id: str,
         component_ids: list[str],
         *,
-        token_scope: str = "all",
+        kind: Literal["zero_ablation", "mean_ablation"] = "zero_ablation",
+        token_scope: Literal["all", "positions"] = "all",
+        positions: list[int] | None = None,
+        metric: MetricSpec | None = None,
         top_k: int = 10,
-    ) -> RunRecord:
+    ) -> InterventionResult:
         with self._lock:
-            if token_scope != "all":
-                raise ValueError("Only all-token zero ablation is currently supported")
             baseline = self._artifacts(baseline_run_id)
-            grouped: dict[int, set[int]] = {}
-            for component_id in component_ids:
-                match = HEAD_ID.fullmatch(component_id)
-                if not match:
-                    raise ValueError(f"Zero ablation currently requires an attention-head ID, received: {component_id}")
-                layer = int(match.group("layer"))
-                head = int(match.group("head"))
-                if layer >= self.architecture.n_layers or head >= self.architecture.n_heads:
-                    raise ValueError(f"Component is outside the loaded architecture: {component_id}")
-                grouped.setdefault(layer, set()).add(head)
-
-            hooks = []
+            resolved_positions = self._resolve_positions(baseline, token_scope, positions or [])
+            grouped = self._group_heads(component_ids)
+            hooks: list[tuple[str, Any]] = []
             for layer, heads in grouped.items():
                 selected_heads = tuple(sorted(heads))
+                reference = baseline.cache[f"blocks.{layer}.attn.hook_result"].float().mean(dim=1)[0]
 
-                def zero_selected(result: Any, hook: Any, indices: tuple[int, ...] = selected_heads) -> Any:
+                def ablate_selected(
+                    result: Any,
+                    hook: Any,
+                    indices: tuple[int, ...] = selected_heads,
+                    token_positions: tuple[int, ...] = tuple(resolved_positions),
+                    reference_values: Any = reference,
+                    ablation_kind: str = kind,
+                ) -> Any:
                     del hook
                     updated = result.clone()
-                    updated[:, :, list(indices), :] = 0
+                    for head in indices:
+                        if ablation_kind == "zero_ablation":
+                            updated[:, list(token_positions), head, :] = 0
+                        else:
+                            mean_value = reference_values[head].to(device=updated.device, dtype=updated.dtype)
+                            updated[:, list(token_positions), head, :] = mean_value
                     return updated
 
-                hooks.append((f"blocks.{layer}.attn.hook_result", zero_selected))
+                hooks.append((f"blocks.{layer}.attn.hook_result", ablate_selected))
 
-            intervention = InterventionSpec(componentIds=component_ids, tokenScope="all")
-            label = "Ablate " + ", ".join(self._display_component(component_id) for component_id in component_ids)
+            intervention = InterventionSpec(
+                kind=kind,
+                componentIds=component_ids,
+                tokenScope=token_scope,
+                positions=[] if token_scope == "all" else resolved_positions,
+                destinationRunId=baseline_run_id,
+                baseline="zero" if kind == "zero_ablation" else "within_prompt_position_mean",
+            )
+            operation = "Zero ablate" if kind == "zero_ablation" else "Mean ablate"
+            label = operation + " " + ", ".join(self._display_component(value) for value in component_ids)
             device = str(getattr(self.model.cfg, "device", self.model_spec.device))
-            tokens = baseline.tokens.to(device)
-            return self._execute(
-                tokens=tokens,
+            created = self._execute(
+                tokens=baseline.tokens.to(device),
                 prompt=baseline.record.prompt,
                 kind="intervened",
                 label=label,
@@ -148,6 +276,197 @@ class ExperimentEngine:
                 seed=baseline.record.seed,
                 hooks=hooks,
             ).record
+            return InterventionResult(run=created, effect=self._effect(baseline_run_id, created.id, metric) if metric else None)
+
+    def zero_ablate(
+        self,
+        baseline_run_id: str,
+        component_ids: list[str],
+        *,
+        token_scope: str = "all",
+        positions: list[int] | None = None,
+        top_k: int = 10,
+    ) -> RunRecord:
+        return self.ablate(
+            baseline_run_id,
+            component_ids,
+            kind="zero_ablation",
+            token_scope=token_scope,  # type: ignore[arg-type]
+            positions=positions,
+            top_k=top_k,
+        ).run
+
+    def patch(
+        self,
+        destination_run_id: str,
+        source_run_id: str,
+        component_ids: list[str],
+        *,
+        mappings: list[PatchMapping] | None = None,
+        metric: MetricSpec | None = None,
+        top_k: int = 10,
+    ) -> InterventionResult:
+        with self._lock:
+            source = self._artifacts(source_run_id)
+            destination = self._artifacts(destination_run_id)
+            if source.record.model_id != destination.record.model_id:
+                raise ValueError("Activation patching requires runs from the same loaded model")
+            if not mappings:
+                alignment = self.align_runs(source_run_id, destination_run_id)
+                mappings = [
+                    PatchMapping(sourcePosition=pair.source_position, destinationPosition=pair.destination_position)
+                    for pair in alignment.pairs
+                    if pair.source_position is not None and pair.destination_position is not None
+                ]
+            if not mappings:
+                raise ValueError("The source and destination runs have no patchable token alignment")
+            for mapping in mappings:
+                if mapping.source_position >= len(source.record.tokens) or mapping.destination_position >= len(destination.record.tokens):
+                    raise ValueError("A patch mapping is outside the source or destination token range")
+
+            grouped = self._group_heads(component_ids)
+            hooks: list[tuple[str, Any]] = []
+            for layer, heads in grouped.items():
+                selected_heads = tuple(sorted(heads))
+                source_result = source.cache[f"blocks.{layer}.attn.hook_result"][0]
+
+                def patch_selected(
+                    result: Any,
+                    hook: Any,
+                    indices: tuple[int, ...] = selected_heads,
+                    source_values: Any = source_result,
+                    token_mappings: tuple[PatchMapping, ...] = tuple(mappings),
+                ) -> Any:
+                    del hook
+                    updated = result.clone()
+                    for mapping in token_mappings:
+                        for head in indices:
+                            value = source_values[mapping.source_position, head].to(
+                                device=updated.device,
+                                dtype=updated.dtype,
+                            )
+                            updated[:, mapping.destination_position, head, :] = value
+                    return updated
+
+                hooks.append((f"blocks.{layer}.attn.hook_result", patch_selected))
+
+            destination_positions = sorted({mapping.destination_position for mapping in mappings})
+            intervention = InterventionSpec(
+                kind="activation_patch",
+                componentIds=component_ids,
+                tokenScope="positions",
+                positions=destination_positions,
+                sourceRunId=source_run_id,
+                destinationRunId=destination_run_id,
+                patchMappings=[
+                    {"sourcePosition": mapping.source_position, "destinationPosition": mapping.destination_position}
+                    for mapping in mappings
+                ],
+                baseline="source_activation",
+            )
+            label = "Patch " + ", ".join(self._display_component(value) for value in component_ids)
+            device = str(getattr(self.model.cfg, "device", self.model_spec.device))
+            created = self._execute(
+                tokens=destination.tokens.to(device),
+                prompt=destination.record.prompt,
+                kind="patched",
+                label=label,
+                interventions=[intervention],
+                parent_run_id=destination_run_id,
+                top_k=top_k,
+                seed=destination.record.seed,
+                hooks=hooks,
+            ).record
+            return InterventionResult(
+                run=created,
+                effect=self._effect(destination_run_id, created.id, metric) if metric else None,
+            )
+
+    def metric(self, run_id: str, spec: MetricSpec) -> MetricResult:
+        artifacts = self._artifacts(run_id)
+        target_id = self._single_token_id(spec.target_token)
+        distractor_id = self._single_token_id(spec.distractor_token) if spec.distractor_token else None
+        position = self._resolve_output_position(artifacts, spec.position)
+        logits = artifacts.logits[0, position].float()
+        value = float(logits[target_id].item())
+        if distractor_id is not None:
+            value -= float(logits[distractor_id].item())
+        return MetricResult(
+            runId=run_id,
+            metric="logit_difference" if distractor_id is not None else "target_logit",
+            position=position,
+            targetTokenId=target_id,
+            targetToken=self._decode_token(target_id),
+            distractorTokenId=distractor_id,
+            distractorToken=self._decode_token(distractor_id) if distractor_id is not None else None,
+            value=value,
+        )
+
+    def head_sweep(
+        self,
+        run_id: str,
+        *,
+        kind: Literal["zero_ablation", "mean_ablation"],
+        token_scope: Literal["all", "positions"],
+        positions: list[int],
+        metric: MetricSpec,
+    ) -> HeadSweepResult:
+        import torch
+
+        with self._lock, torch.inference_mode():
+            started = time.perf_counter()
+            baseline = self._artifacts(run_id)
+            baseline_metric = self.metric(run_id, metric)
+            target_id = baseline_metric.target_token_id
+            distractor_id = baseline_metric.distractor_token_id
+            output_position = baseline_metric.position
+            token_positions = self._resolve_positions(baseline, token_scope, positions)
+            device = str(getattr(self.model.cfg, "device", self.model_spec.device))
+            effects: list[HeadEffect] = []
+
+            for layer in range(self.architecture.n_layers):
+                tokens = baseline.tokens.to(device).repeat(self.architecture.n_heads, 1)
+                reference = baseline.cache[f"blocks.{layer}.attn.hook_result"].float().mean(dim=1)[0]
+
+                def ablate_each_head(result: Any, hook: Any) -> Any:
+                    del hook
+                    updated = result.clone()
+                    for head in range(self.architecture.n_heads):
+                        if kind == "zero_ablation":
+                            updated[head, token_positions, head, :] = 0
+                        else:
+                            mean_value = reference[head].to(device=updated.device, dtype=updated.dtype)
+                            updated[head, token_positions, head, :] = mean_value
+                    return updated
+
+                logits = self.model.run_with_hooks(
+                    tokens,
+                    fwd_hooks=[(f"blocks.{layer}.attn.hook_result", ablate_each_head)],
+                ).detach().to("cpu").float()
+                values = logits[:, output_position, target_id]
+                if distractor_id is not None:
+                    values = values - logits[:, output_position, distractor_id]
+                for head, value in enumerate(values.tolist()):
+                    effects.append(
+                        HeadEffect(
+                            componentId=f"blocks.{layer}.attn.head.{head}",
+                            layer=layer,
+                            head=head,
+                            metricValue=float(value),
+                            delta=float(value - baseline_metric.value),
+                        )
+                    )
+
+            deltas = [effect.delta for effect in effects]
+            return HeadSweepResult(
+                runId=run_id,
+                kind=kind,
+                metric=baseline_metric,
+                effects=effects,
+                minimum=min(deltas, default=0.0),
+                maximum=max(deltas, default=0.0),
+                durationMs=round((time.perf_counter() - started) * 1000, 3),
+            )
 
     def attention(self, run_id: str, layer: int, head: int) -> AttentionResult:
         artifacts = self._artifacts(run_id)
@@ -190,15 +509,9 @@ class ExperimentEngine:
         tensor = artifacts.cache[hook_name].float()
         head_index = node.head
         if head_index is not None and tensor.ndim >= 4:
-            if "hook_pattern" in hook_name or "hook_attn_scores" in hook_name:
-                tensor = tensor[:, head_index]
-            else:
-                tensor = tensor[:, :, head_index]
+            tensor = tensor[:, head_index] if "hook_pattern" in hook_name or "hook_attn_scores" in hook_name else tensor[:, :, head_index]
         tensor = tensor[0]
-        if tensor.ndim == 1:
-            values = tensor.abs()
-        else:
-            values = tensor.reshape(tensor.shape[0], -1).norm(dim=-1)
+        values = tensor.abs() if tensor.ndim == 1 else tensor.reshape(tensor.shape[0], -1).norm(dim=-1)
         return ActivationSeries(
             runId=run_id,
             componentId=component_id,
@@ -216,10 +529,7 @@ class ExperimentEngine:
         target_token_id: int | None = None,
     ) -> ResidualStreamResult:
         artifacts = self._artifacts(run_id)
-        token_count = len(artifacts.record.tokens)
-        resolved_position = position if position >= 0 else token_count + position
-        if resolved_position < 0 or resolved_position >= token_count:
-            raise ValueError("Residual-stream position is outside the prompt")
+        resolved_position = self._resolve_output_position(artifacts, position)
         if target_token_id is None:
             target_token_id = artifacts.record.top_predictions[0].token_id
 
@@ -295,6 +605,11 @@ class ExperimentEngine:
             tokens=rows,
         )
 
+    def _effect(self, baseline_run_id: str, intervened_run_id: str, metric: MetricSpec) -> CausalEffect:
+        baseline = self.metric(baseline_run_id, metric)
+        intervened = self.metric(intervened_run_id, metric)
+        return CausalEffect(baseline=baseline, intervened=intervened, delta=intervened.value - baseline.value)
+
     def _execute(
         self,
         *,
@@ -326,9 +641,6 @@ class ExperimentEngine:
         cache_bytes = sum(int(value.nelement() * value.element_size()) for value in cache_dict.values())
         run_id = f"run_{uuid4().hex[:12]}"
         token_strings = [str(token) for token in self.model.to_str_tokens(cpu_tokens[0])]
-        token_rows = self._token_rows(cpu_tokens, cpu_logits, token_strings)
-        predictions = self._predictions(cpu_logits[0, -1], top_k)
-        requested = sorted(cache_dict)
         record = RunRecord(
             id=run_id,
             kind=kind,
@@ -336,9 +648,9 @@ class ExperimentEngine:
             modelId=self.model_spec.id,
             modelRevision=self.model_spec.revision,
             prompt=prompt,
-            tokens=token_rows,
-            topPredictions=predictions,
-            requestedActivations=requested,
+            tokens=self._token_rows(cpu_tokens, cpu_logits, token_strings),
+            topPredictions=self._predictions(cpu_logits[0, -1], top_k),
+            requestedActivations=sorted(cache_dict),
             interventions=interventions,
             parentRunId=parent_run_id,
             device=str(getattr(self.model.cfg, "device", self.model_spec.device)),
@@ -350,8 +662,8 @@ class ExperimentEngine:
             provenance={
                 "backend": "transformer_lens",
                 "exact": True,
-                "tokenScope": "all",
                 "cachePolicy": "interactive-core",
+                "interventionCount": len(interventions),
             },
         )
         artifacts = RunArtifacts(record=record, tokens=cpu_tokens, logits=cpu_logits, cache=cache_dict)
@@ -390,6 +702,48 @@ class ExperimentEngine:
             )
             for logit, token_id in zip(values.tolist(), indices.tolist(), strict=True)
         ]
+
+    def _single_token_id(self, text: str | None) -> int:
+        if text is None:
+            raise ValueError("A token value is required")
+        token_ids = self.model.tokenizer.encode(text, add_special_tokens=False)
+        if len(token_ids) != 1:
+            displays = [self._display_token(self._decode_token(int(token_id))) for token_id in token_ids]
+            raise ValueError(
+                f"Metric token {text!r} encodes to {len(token_ids)} tokens ({', '.join(displays) or 'none'}); enter exactly one model token"
+            )
+        return int(token_ids[0])
+
+    def _resolve_output_position(self, artifacts: RunArtifacts, position: int) -> int:
+        token_count = len(artifacts.record.tokens)
+        resolved = position if position >= 0 else token_count + position
+        if resolved < 0 or resolved >= token_count:
+            raise ValueError("Metric position is outside the prompt")
+        return resolved
+
+    def _resolve_positions(self, artifacts: RunArtifacts, token_scope: str, positions: list[int]) -> list[int]:
+        token_count = len(artifacts.record.tokens)
+        if token_scope == "all":
+            return list(range(token_count))
+        if token_scope != "positions" or not positions:
+            raise ValueError("Choose one or more token positions")
+        resolved = sorted(set(positions))
+        if resolved[0] < 0 or resolved[-1] >= token_count:
+            raise ValueError("An intervention position is outside the prompt")
+        return resolved
+
+    def _group_heads(self, component_ids: list[str]) -> dict[int, set[int]]:
+        grouped: dict[int, set[int]] = {}
+        for component_id in component_ids:
+            match = HEAD_ID.fullmatch(component_id)
+            if not match:
+                raise ValueError(f"Causal head interventions require an attention-head ID, received: {component_id}")
+            layer = int(match.group("layer"))
+            head = int(match.group("head"))
+            if layer >= self.architecture.n_layers or head >= self.architecture.n_heads:
+                raise ValueError(f"Component is outside the loaded architecture: {component_id}")
+            grouped.setdefault(layer, set()).add(head)
+        return grouped
 
     def _decode_token(self, token_id: int) -> str:
         return str(self.model.tokenizer.decode([token_id]))

@@ -43,16 +43,17 @@ function mockConnectedBackend() {
   });
 }
 
-function runRecord(kind: "clean" | "intervened" = "clean"): RunRecord {
+function runRecord(kind: RunRecord["kind"] = "clean"): RunRecord {
+  const intervened = kind === "intervened" || kind === "patched";
   return {
-    id: kind === "clean" ? "run_clean" : "run_ablation", kind,
-    label: kind === "clean" ? "Clean run" : "Ablate L5H3", status: "complete",
-    modelId: "gpt2-small", modelRevision: null, prompt: "The capital of France is",
+    id: kind === "clean" ? "run_clean" : kind === "corrupted" ? "run_corrupted" : kind === "patched" ? "run_patch" : "run_ablation", kind,
+    label: kind === "clean" ? "Clean run" : kind === "corrupted" ? "Corrupted destination" : kind === "patched" ? "Patch L5H3" : "Ablate L5H3", status: "complete",
+    modelId: "gpt2-small", modelRevision: null, prompt: kind === "corrupted" || kind === "patched" ? "The capital of Germany is" : "The capital of France is",
     tokens: [{ position: 0, tokenId: 464, text: "The", display: "The", nextToken: "·capital", nextTokenProbability: .42 }],
     topPredictions: [{ tokenId: 6342, text: " Paris", display: "·Paris", logit: 8.2, probability: .38 }],
     requestedActivations: ["blocks.5.attn.hook_pattern"],
-    interventions: kind === "clean" ? [] : [{ kind: "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all" }],
-    parentRunId: kind === "clean" ? null : "run_clean", device: "cpu", dtype: "torch.float32",
+    interventions: intervened ? [{ kind: kind === "patched" ? "activation_patch" : "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all", positions: [], sourceRunId: kind === "patched" ? "run_clean" : null, destinationRunId: kind === "patched" ? "run_corrupted" : "run_clean", patchMappings: [], baseline: kind === "patched" ? "source_activation" : "zero" }] : [],
+    parentRunId: intervened ? (kind === "patched" ? "run_corrupted" : "run_clean") : null, device: "cpu", dtype: "torch.float32",
     seed: 0, durationMs: 14.2, cacheBytes: 4096, createdAt: new Date().toISOString(),
     provenance: { backend: "transformer_lens", exact: true },
   };
@@ -68,7 +69,18 @@ function mockResearchBackend() {
     if (url.endsWith("/architecture")) body = graph;
     if (url.endsWith("/api/v1/runs") && init?.method !== "POST") body = [];
     if (url.endsWith("/api/v1/runs") && init?.method === "POST") body = runRecord();
+    if (url.endsWith("/api/v1/contrasts")) body = {
+      id: "contrast_test",
+      cleanRun: runRecord("clean"),
+      corruptedRun: runRecord("corrupted"),
+      alignment: {
+        sourceRunId: "run_clean", destinationRunId: "run_corrupted", strategy: "minimum_edit_distance",
+        exactMatches: 1, sourceLength: 1, destinationLength: 1,
+        pairs: [{ sourcePosition: 0, destinationPosition: 0, sourceToken: "The", destinationToken: "The", status: "exact" }],
+      },
+    };
     if (url.endsWith("/zero-ablate")) body = runRecord("intervened");
+    if (url.endsWith("/ablate")) body = { run: runRecord("intervened"), effect: null };
     if (url.includes("/compare/")) body = { baselineRunId: "run_clean", intervenedRunId: "run_ablation", baselineTopToken: " Paris", baselineTopTokenDelta: -1.1, klDivergence: .02, tokens: [{ tokenId: 6342, text: " Paris", display: "·Paris", baselineLogit: 8.2, intervenedLogit: 7.1, deltaLogit: -1.1, baselineProbability: .38, intervenedProbability: .24, deltaProbability: -.14 }] };
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   });
@@ -107,7 +119,7 @@ test("runs a real-workflow manifest and compares an exact head ablation", async 
   expect(screen.getAllByText("·Paris").length).toBeGreaterThan(0);
 
   await user.click(screen.getByRole("button", { name: "Zero Ablate" }));
-  expect(await screen.findByText("Clean versus intervention")).toBeInTheDocument();
+  expect(await screen.findByText("Baseline versus intervention")).toBeInTheDocument();
   expect(screen.getByText(/Zero ablation can be out of distribution/)).toBeInTheDocument();
 });
 
@@ -119,4 +131,31 @@ test("fits the complete expanded diagram instead of resetting to a preset zoom",
 
   const small = calculateFitTransform(1000, 600, 300, 200, 40);
   expect(small.zoom).toBe(1);
+});
+
+test("runs a clean and corrupted contrast and exposes its token alignment", async () => {
+  mockResearchBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Contrast" }));
+  expect(screen.getByRole("heading", { name: "Contrast experiment" })).toBeInTheDocument();
+  await user.click(screen.getByRole("button", { name: "Run contrast" }));
+
+  await user.click(await screen.findByRole("button", { name: "Alignment" }));
+  expect(await screen.findByText("Clean ↔ corrupted token alignment")).toBeInTheDocument();
+  expect(screen.getByText("Minimum-edit alignment used for activation patch mappings")).toBeInTheDocument();
+});
+
+test("saves a durable browser workspace snapshot", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: /Save current workspace/i }));
+  await user.type(screen.getByRole("textbox", { name: "Name" }), "Geography facts");
+  await user.click(screen.getByRole("button", { name: "Save workspace" }));
+
+  expect(await screen.findByRole("button", { name: "Geography facts" })).toBeInTheDocument();
+  expect(localStorage.getItem("kannaadi.workspaces")).toContain("Geography facts");
 });
