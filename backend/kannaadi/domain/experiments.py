@@ -200,6 +200,73 @@ class InterventionResult(BaseModel):
     effect: CausalEffect | None = None
 
 
+class DatasetAblationRequest(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    run_ids: list[str] = Field(alias="runIds", min_length=1, max_length=256)
+    kind: Literal["zero_ablation", "mean_ablation"] = "zero_ablation"
+    component_ids: list[str] = Field(alias="componentIds", min_length=1)
+    token_scope: Literal["all", "positions"] = Field(alias="tokenScope", default="all")
+    positions: list[int] = Field(default_factory=list)
+    metric: MetricSpec
+
+    @model_validator(mode="after")
+    def validate_dataset(self) -> "DatasetAblationRequest":
+        if len(set(self.run_ids)) != len(self.run_ids):
+            raise ValueError("Dataset experiments require unique baseline run IDs")
+        if self.token_scope == "positions" and not self.positions:
+            raise ValueError("Choose one or more token positions for a position-scoped dataset experiment")
+        return self
+
+
+class DatasetAblationRow(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    baseline_run_id: str = Field(alias="baselineRunId")
+    intervened_run_id: str | None = Field(alias="intervenedRunId", default=None)
+    intervened_run: RunRecord | None = Field(alias="intervenedRun", default=None)
+    label: str
+    prompt: str
+    status: Literal["complete", "error"]
+    baseline_value: float | None = Field(alias="baselineValue", default=None)
+    intervened_value: float | None = Field(alias="intervenedValue", default=None)
+    delta: float | None = None
+    error: str | None = None
+
+
+class DatasetAblationSummary(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    requested_count: int = Field(alias="requestedCount")
+    completed_count: int = Field(alias="completedCount")
+    failed_count: int = Field(alias="failedCount")
+    mean_delta: float | None = Field(alias="meanDelta")
+    median_delta: float | None = Field(alias="medianDelta")
+    standard_deviation: float | None = Field(alias="standardDeviation")
+    minimum_delta: float | None = Field(alias="minimumDelta")
+    maximum_delta: float | None = Field(alias="maximumDelta")
+    mean_absolute_delta: float | None = Field(alias="meanAbsoluteDelta")
+    direction_consistency: float | None = Field(alias="directionConsistency")
+
+
+class DatasetAblationResult(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
+    id: str
+    kind: Literal["zero_ablation", "mean_ablation"]
+    component_ids: list[str] = Field(alias="componentIds")
+    token_scope: Literal["all", "positions"] = Field(alias="tokenScope")
+    positions: list[int]
+    metric: MetricSpec
+    rows: list[DatasetAblationRow]
+    summary: DatasetAblationSummary
+    duration_ms: float = Field(alias="durationMs")
+    caveat: str = (
+        "Each row is an exact intervention on one cached prompt run. The aggregate describes "
+        "this selected prompt set and is not a population-level causal estimate."
+    )
+
+
 class HeadEffect(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
 
@@ -335,10 +402,14 @@ class ActivationSeries(BaseModel):
 
 
 class ResidualPoint(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+
     layer: int
     stage: Literal["pre", "mid", "post"]
     norm: float
     target_logit: float = Field(alias="targetLogit")
+    entropy: float
+    top_predictions: list[Prediction] = Field(alias="topPredictions")
 
 
 class ResidualStreamResult(BaseModel):

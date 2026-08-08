@@ -19,7 +19,10 @@ import {
   History,
   Info,
   Layers3,
+  Library,
+  ListPlus,
   Maximize2,
+  Moon,
   MousePointer2,
   Play,
   Plus,
@@ -30,6 +33,8 @@ import {
   SlidersHorizontal,
   Sparkles,
   SquareDashedMousePointer,
+  Sun,
+  Trash2,
   Undo2,
   X,
   ZoomIn,
@@ -52,14 +57,22 @@ import type {
   AttributionResult,
   AttentionResult,
   CausalEffect,
+  CodeArtifact,
+  CodeCell,
+  CodeSessionStatus,
   ComponentNode,
   ComponentGroup,
   ContrastResult,
+  DatasetAblationResult,
+  ExperimentSeries,
   HeadSweepResult,
   LayerNode,
   MetricSpec,
   ModelCatalogEntry,
   MlpSweepResult,
+  InterventionRecipe,
+  PromptCollection,
+  PromptEntry,
   ResidualStreamResult,
   RunComparison,
   RunRecord,
@@ -69,7 +82,7 @@ import type {
 import { listWorkspaces, loadWorkspace, saveWorkspace } from "./workspaces";
 
 type Tool = "pointer" | "box" | "pan";
-type PanelTab = "Tokens" | "Alignment" | "Attention" | "QK / OV" | "Logits" | "Activations" | "Residual Stream" | "Causal Sweep" | "Attribution" | "Code";
+type PanelTab = "Tokens" | "Experiments" | "Alignment" | "Attention" | "QK / OV" | "Logits" | "Activations" | "Residual Stream" | "Causal Sweep" | "Attribution" | "Code";
 
 const DEFAULT_MODEL: ModelCatalogEntry = {
   id: "gpt2-small",
@@ -79,6 +92,12 @@ const DEFAULT_MODEL: ModelCatalogEntry = {
   parameterCount: "124M",
 };
 const api = new KannaadiApi();
+const DEFAULT_PROMPT: PromptEntry = {
+  id: "prompt-capital-france",
+  name: "Capital of France",
+  text: "The capital of France is",
+  createdAt: "2026-01-01T00:00:00.000Z",
+};
 
 export function App() {
   const [architecture, setArchitecture] = useState<ArchitectureGraph | null>(null);
@@ -89,17 +108,32 @@ export function App() {
   const [corruptedPrompt, setCorruptedPrompt] = usePersistentText("kannaadi.corruptedPrompt", "The capital of Germany is");
   const [targetToken, setTargetToken] = usePersistentText("kannaadi.targetToken", " Paris");
   const [distractorToken, setDistractorToken] = usePersistentText("kannaadi.distractorToken", " Berlin");
+  const [prompts, setPrompts] = usePersistentJson<PromptEntry[]>("kannaadi.prompts", [DEFAULT_PROMPT]);
+  const [collections, setCollections] = usePersistentJson<PromptCollection[]>("kannaadi.promptCollections", []);
+  const [experimentSeries, setExperimentSeries] = usePersistentJson<ExperimentSeries[]>("kannaadi.experimentSeries", []);
+  const [datasetAblations, setDatasetAblations] = usePersistentJson<DatasetAblationResult[]>("kannaadi.datasetAblations", []);
+  const [registeredModels, setRegisteredModels] = usePersistentJson<ModelCatalogEntry[]>("kannaadi.registeredModels", []);
+  const [activePromptId, setActivePromptId] = usePersistentText("kannaadi.activePrompt", DEFAULT_PROMPT.id);
+  const [theme, setTheme] = usePersistentText("kannaadi.theme", "light") as ["light" | "dark", (value: string) => void];
   const [runs, setRuns] = useState<RunRecord[]>([]);
   const [activeRunId, setActiveRunId] = useState<string | null>(null);
+  const [archivedRunIds, setArchivedRunIds] = useState<Set<string>>(new Set());
   const [contrast, setContrast] = useState<ContrastResult | null>(null);
   const [effects, setEffects] = useState<Record<string, CausalEffect>>({});
   const [loading, setLoading] = useState(false);
   const [running, setRunning] = useState(false);
   const [modelDialog, setModelDialog] = useState(false);
   const [experimentDialog, setExperimentDialog] = useState(false);
+  const [promptManagerDialog, setPromptManagerDialog] = useState(false);
+  const [runDialog, setRunDialog] = useState(false);
+  const [batchProgress, setBatchProgress] = useState<{ name: string; completed: number; total: number } | null>(null);
   const [connectionError, setConnectionError] = useState<string | null>(null);
 
   const activeRun = runs.find((run) => run.id === activeRunId) ?? null;
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   const updateRuntimeForRun = (run: RunRecord) => {
     setRuntime((current) => current ? {
@@ -114,9 +148,18 @@ export function App() {
     void (async () => {
       try {
         await api.connect();
+        const restoredModels: ModelCatalogEntry[] = [];
+        for (const savedModel of registeredModels) {
+          try {
+            restoredModels.push(await api.registerModel(savedModel.repository, savedModel.displayName));
+          } catch {
+            // A missing local directory remains visible in settings but does not
+            // prevent the rest of the desktop state from opening.
+          }
+        }
         const [nextModels, nextStatus] = await Promise.all([api.models(), api.status()]);
         if (cancelled) return;
-        setModels(nextModels);
+        setModels([...nextModels, ...restoredModels].filter((model, index, all) => all.findIndex((entry) => entry.id === model.id) === index));
         setRuntime(nextStatus);
         if (nextStatus.loadedModelId) {
           const [graph, existingRuns] = await Promise.all([
@@ -176,23 +219,76 @@ export function App() {
     }
   };
 
-  const runPrompt = async () => {
+  const runPrompt = async (promptText = prompt, label?: string) => {
     if (!architecture) {
-      await loadModel();
-      return;
+      throw new Error("Load the selected model before starting a run");
     }
-    if (!prompt.trim()) return;
+    if (!promptText.trim()) return;
     setRunning(true);
     setConnectionError(null);
     try {
-      const run = await api.run(prompt);
+      const run = await api.run(promptText, 10, "clean", label);
       setRuns((current) => [run, ...current]);
+      setArchivedRunIds((current) => { const next = new Set(current); next.delete(run.id); return next; });
       setActiveRunId(run.id);
       updateRuntimeForRun(run);
+      return run;
     } catch (error) {
       setConnectionError(error instanceof Error ? error.message : "Prompt execution failed");
+      return undefined;
     } finally {
       setRunning(false);
+    }
+  };
+
+  const runBatch = async (collectionId: string) => {
+    if (!architecture) throw new Error("Load the selected model before starting a batch");
+    const collection = collections.find((entry) => entry.id === collectionId);
+    if (!collection) throw new Error("Prompt collection no longer exists");
+    const batchPrompts = collection.promptIds.map((id) => prompts.find((entry) => entry.id === id)).filter(Boolean) as PromptEntry[];
+    if (!batchPrompts.length) throw new Error("Add at least one prompt to this collection");
+    setRunning(true); setConnectionError(null); setBatchProgress({ name: collection.name, completed: 0, total: batchPrompts.length });
+    const completed: RunRecord[] = [];
+    const seriesId = crypto.randomUUID();
+    try {
+      for (let index = 0; index < batchPrompts.length; index += 1) {
+        const entry = batchPrompts[index];
+        const run = await api.run(entry.text, 10, "clean", `${collection.name} · ${entry.name}`);
+        completed.push(run);
+        updateRuntimeForRun(run);
+        setBatchProgress({ name: collection.name, completed: index + 1, total: batchPrompts.length });
+      }
+      const newestFirst = [...completed].reverse();
+      setRuns((current) => [...newestFirst, ...current]);
+      setActiveRunId(newestFirst[0]?.id ?? null);
+      setRunDialog(false);
+      return completed;
+    } catch (error) {
+      if (completed.length) setRuns((current) => [...completed].reverse().concat(current));
+      setConnectionError(error instanceof Error ? error.message : "Prompt batch failed");
+      throw error;
+    } finally {
+      if (completed.length) {
+        const series: ExperimentSeries = {
+          id: seriesId,
+          collectionId: collection.id,
+          collectionName: collection.name,
+          runIds: completed.map((run) => run.id),
+          createdAt: new Date().toISOString(),
+        };
+        setExperimentSeries((current) => [series, ...current]);
+      }
+      setRunning(false); setBatchProgress(null);
+    }
+  };
+
+  const recordDatasetAblation = (result: DatasetAblationResult) => {
+    setDatasetAblations((current) => [result, ...current.filter((entry) => entry.id !== result.id)]);
+    const created = result.rows.flatMap((row) => row.intervenedRun ? [row.intervenedRun] : []);
+    if (created.length) {
+      setRuns((current) => [...created].reverse().concat(current.filter((run) => !created.some((entry) => entry.id === run.id))));
+      setActiveRunId(created.at(-1)?.id ?? null);
+      created.forEach(updateRuntimeForRun);
     }
   };
 
@@ -283,8 +379,16 @@ export function App() {
   const registerModel = async (source: string, displayName?: string) => {
     const entry = await api.registerModel(source, displayName);
     setModels((current) => [...current.filter((model) => model.id !== entry.id), entry]);
+    if (entry.id !== DEFAULT_MODEL.id) setRegisteredModels((current) => [...current.filter((model) => model.id !== entry.id), entry]);
     chooseModel(entry.id);
     setModelDialog(false);
+  };
+
+  const selectPrompt = (promptId: string) => {
+    const entry = prompts.find((candidate) => candidate.id === promptId);
+    if (!entry) return;
+    setActivePromptId(promptId);
+    setPrompt(entry.text);
   };
 
   useEffect(() => {
@@ -311,9 +415,12 @@ export function App() {
         activeRun={activeRun}
         loading={loading}
         running={running}
-        onPrimaryAction={architecture ? runPrompt : loadModel}
+        onPrimaryAction={() => void (architecture ? runPrompt() : loadModel())}
         onAddModel={() => setModelDialog(true)}
         onExperiment={() => setExperimentDialog(true)}
+        theme={theme}
+        onToggleTheme={() => setTheme(theme === "dark" ? "light" : "dark")}
+        batchProgress={batchProgress}
       />
       <Workbench
         architecture={architecture}
@@ -321,6 +428,7 @@ export function App() {
         model={models.find((model) => model.id === modelId) || DEFAULT_MODEL}
         prompt={prompt}
         runs={runs}
+        onRunsChanged={setRuns}
         activeRun={activeRun}
         setActiveRunId={setActiveRunId}
         causalAblate={causalAblate}
@@ -330,6 +438,32 @@ export function App() {
         targetToken={targetToken}
         distractorToken={distractorToken}
         corruptedPrompt={corruptedPrompt}
+        models={models}
+        prompts={prompts}
+        collections={collections}
+        experimentSeries={experimentSeries}
+        datasetAblations={datasetAblations}
+        activePromptId={activePromptId}
+        archivedRunIds={archivedRunIds}
+        theme={theme}
+        onSelectPrompt={selectPrompt}
+        onManagePrompts={() => setPromptManagerDialog(true)}
+        onNewRun={() => setRunDialog(true)}
+        onDatasetAblation={recordDatasetAblation}
+        onRestoreResearchState={(snapshot) => {
+          if (snapshot.prompts?.length) setPrompts(snapshot.prompts);
+          if (snapshot.collections) setCollections(snapshot.collections);
+          if (snapshot.experimentSeries) setExperimentSeries(snapshot.experimentSeries);
+          if (snapshot.results?.datasetAblations) setDatasetAblations(snapshot.results.datasetAblations);
+          if (snapshot.registeredModels) setRegisteredModels(snapshot.registeredModels.filter((entry) => entry.id !== DEFAULT_MODEL.id));
+          if (snapshot.theme) setTheme(snapshot.theme);
+          const savedRuns = snapshot.results?.runs ?? [];
+          setRuns(savedRuns);
+          setArchivedRunIds(new Set(savedRuns.map((run) => run.id)));
+          setActiveRunId(savedRuns[0]?.id ?? null);
+          setContrast(snapshot.results?.contrast ?? null);
+          setEffects(snapshot.results?.effects ?? {});
+        }}
         onRestoreWorkspace={(snapshot) => {
           setPrompt(snapshot.prompt);
           setCorruptedPrompt(snapshot.corruptedPrompt);
@@ -343,6 +477,40 @@ export function App() {
         onRetryService={() => void retryDesktopService()}
       />
       {modelDialog && <ModelDialog onClose={() => setModelDialog(false)} onRegister={registerModel} />}
+      {promptManagerDialog && <PromptManagerDialog
+        prompts={prompts}
+        collections={collections}
+        running={running}
+        loaded={Boolean(architecture)}
+        onClose={() => setPromptManagerDialog(false)}
+        onSavePrompt={(name, text) => {
+          const entry: PromptEntry = { id: crypto.randomUUID(), name, text, createdAt: new Date().toISOString() };
+          setPrompts((current) => [...current, entry]);
+          setActivePromptId(entry.id);
+          setPrompt(entry.text);
+        }}
+        onDeletePrompt={(id) => {
+          setPrompts((current) => current.filter((entry) => entry.id !== id));
+          setCollections((current) => current.map((entry) => ({ ...entry, promptIds: entry.promptIds.filter((promptId) => promptId !== id) })));
+        }}
+        onSaveCollection={(name, promptIds) => setCollections((current) => [...current, { id: crypto.randomUUID(), name, promptIds, createdAt: new Date().toISOString() }])}
+        onDeleteCollection={(id) => setCollections((current) => current.filter((entry) => entry.id !== id))}
+        onRunBatch={(id) => runBatch(id)}
+      />}
+      {runDialog && <RunDialog
+        prompts={prompts}
+        collections={collections}
+        currentPrompt={prompt}
+        running={running}
+        loaded={Boolean(architecture)}
+        onClose={() => setRunDialog(false)}
+        onRun={async (promptId, label) => {
+          const entry = prompts.find((candidate) => candidate.id === promptId);
+          const run = await runPrompt(entry?.text ?? prompt, label || entry?.name);
+          if (run) setRunDialog(false);
+        }}
+        onRunBatch={(id) => runBatch(id)}
+      />}
       {experimentDialog && <ExperimentDialog
         cleanPrompt={prompt}
         corruptedPrompt={corruptedPrompt}
@@ -375,12 +543,15 @@ function TopBar(props: {
   onPrimaryAction: () => void;
   onAddModel: () => void;
   onExperiment: () => void;
+  theme: "light" | "dark";
+  onToggleTheme: () => void;
+  batchProgress: { name: string; completed: number; total: number } | null;
 }) {
-  const { models, modelId, setModelId, prompt, setPrompt, architecture, runtime, activeRun, loading, running, onPrimaryAction, onAddModel, onExperiment } = props;
+  const { models, modelId, setModelId, prompt, setPrompt, architecture, runtime, activeRun, loading, running, onPrimaryAction, onAddModel, onExperiment, theme, onToggleTheme, batchProgress } = props;
   const busy = loading || running || runtime?.loadState === "loading";
   return (
     <header className="top-bar">
-      <div className="brand" aria-label="Kannaadi"><KannaadiLogo /><span>Kannaadi</span></div>
+      <div className="brand" aria-label="Kannaadi"><KannaadiLogo /><span>Kannaadi</span><button className="theme-toggle" aria-label={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} title={`Switch to ${theme === "dark" ? "light" : "dark"} mode`} onClick={onToggleTheme}>{theme === "dark" ? <Sun /> : <Moon />}</button></div>
       <div className="model-select control-field">
         <Cpu size={15} />
         <select aria-label="Model" value={modelId} onChange={(event) => setModelId(event.target.value)}>
@@ -407,7 +578,7 @@ function TopBar(props: {
         {loading ? "Loading model" : running ? "Running" : architecture ? "Run" : "Load model"}
       </button>
       <button className="experiment-button" onClick={onExperiment} disabled={busy}><FlaskConical />Contrast</button>
-      <div className="run-mode"><span>Active Run</span><div className="run-state"><i className={`status-dot ${activeRun?.kind ?? "clean"}`} />{activeRun?.label ?? "No run yet"}</div></div>
+      <div className="run-mode"><span>{batchProgress ? `Batch ${batchProgress.completed}/${batchProgress.total}` : "Active Run"}</span><div className="run-state"><i className={`status-dot ${activeRun?.kind ?? "clean"}`} />{batchProgress?.name ?? activeRun?.label ?? "No run yet"}</div></div>
     </header>
   );
 }
@@ -418,6 +589,7 @@ function Workbench(props: {
   model: ModelCatalogEntry;
   prompt: string;
   runs: RunRecord[];
+  onRunsChanged: (runs: RunRecord[]) => void;
   activeRun: RunRecord | null;
   setActiveRunId: (runId: string) => void;
   causalAblate: (componentIds: string[], kind: "zero_ablation" | "mean_ablation", positions: number[] | null) => Promise<void>;
@@ -427,13 +599,26 @@ function Workbench(props: {
   targetToken: string;
   distractorToken: string;
   corruptedPrompt: string;
+  models: ModelCatalogEntry[];
+  prompts: PromptEntry[];
+  collections: PromptCollection[];
+  experimentSeries: ExperimentSeries[];
+  datasetAblations: DatasetAblationResult[];
+  activePromptId: string;
+  archivedRunIds: Set<string>;
+  theme: "light" | "dark";
+  onSelectPrompt: (promptId: string) => void;
+  onManagePrompts: () => void;
+  onNewRun: () => void;
+  onDatasetAblation: (result: DatasetAblationResult) => void;
+  onRestoreResearchState: (snapshot: WorkspaceSnapshot) => void;
   onRestoreWorkspace: (snapshot: WorkspaceSnapshot) => void;
   loading: boolean;
   running: boolean;
   connectionError: string | null;
   onRetryService: () => void;
 }) {
-  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, causalAblate, patchActivations, contrast, effects, targetToken, distractorToken, corruptedPrompt, onRestoreWorkspace, loading, running, connectionError, onRetryService } = props;
+  const { architecture, runtime, model, prompt, runs, activeRun, setActiveRunId, causalAblate, patchActivations, contrast, effects, targetToken, distractorToken, corruptedPrompt, models, prompts, collections, experimentSeries, datasetAblations, activePromptId, archivedRunIds, theme, onSelectPrompt, onManagePrompts, onNewRun, onDatasetAblation, onRestoreResearchState, onRestoreWorkspace, loading, running, connectionError, onRetryService } = props;
   const [selection, setSelection] = useState<string[]>([]);
   const [past, setPast] = useState<string[][]>([]);
   const [future, setFuture] = useState<string[][]>([]);
@@ -454,10 +639,17 @@ function Workbench(props: {
   const [sweepKind, setSweepKind] = useState<"heads" | "mlps">("heads");
   const [attribution, setAttribution] = useState<AttributionResult | null>(null);
   const [sweepLoading, setSweepLoading] = useState(false);
+  const [datasetLoading, setDatasetLoading] = useState(false);
   const [attributionLoading, setAttributionLoading] = useState(false);
   const [scopePosition, setScopePosition] = useState<number | null>(null);
+  const [residualPosition, setResidualPosition] = useState(-1);
+  const [residualTargetTokenId, setResidualTargetTokenId] = useState<number | null>(null);
   const [groups, setGroups] = usePersistentJson<ComponentGroup[]>("kannaadi.groups", []);
+  const [recipes, setRecipes] = usePersistentJson<InterventionRecipe[]>("kannaadi.interventionRecipes", []);
+  const [scratchpads, setScratchpads] = usePersistentJson<Record<string, string>>("kannaadi.codeScratchpads", {});
+  const [codeCells, setCodeCells] = usePersistentJson<Record<string, CodeCell[]>>("kannaadi.codeCells", {});
   const [groupDialog, setGroupDialog] = useState(false);
+  const [recipeDialog, setRecipeDialog] = useState(false);
   const [workspaceDialog, setWorkspaceDialog] = useState(false);
   const [selectionDialog, setSelectionDialog] = useState(false);
   const [workspaceNames, setWorkspaceNames] = useState<string[]>([]);
@@ -472,6 +664,7 @@ function Workbench(props: {
   const selectedNodes = selection.map((id) => nodeIndex.get(id)).filter(Boolean) as ComponentNode[];
   const primary = selectedNodes.at(-1) || null;
   const activeEffect = activeRun ? effects[activeRun.id] ?? null : null;
+  const activeRunArchived = Boolean(activeRun && archivedRunIds.has(activeRun.id));
   const scopedPositions = scopePosition === null ? null : [scopePosition];
 
   useEffect(() => {
@@ -491,6 +684,7 @@ function Workbench(props: {
     if (additive) commitSelection(selection.includes(node.id) ? selection.filter((id) => id !== node.id) : [...selection, node.id]);
     else commitSelection([node.id]);
     if (node.kind === "head" && activeRun) setActiveTab("Attention");
+    if (node.kind === "residual" && activeRun) setActiveTab("Residual Stream");
   }, [activeRun, commitSelection, selection]);
 
   const undo = () => {
@@ -532,6 +726,12 @@ function Workbench(props: {
       setAttention(null); setActivation(null); setResidual(null); setComparison(null);
       return;
     }
+    if (activeRunArchived) {
+      if (activeTab !== "Tokens" && activeTab !== "Experiments" && activeTab !== "Code" && !(activeTab === "Residual Stream" && residual?.runId === activeRun.id)) {
+        setEvidenceError("This is a persisted result summary. Rerun the prompt to recreate live activation tensors for this analysis.");
+      }
+      return;
+    }
     if (activeTab === "Attention" || activeTab === "QK / OV") setAttention(null);
     if (activeTab === "Activations") setActivation(null);
     if (activeTab === "Residual Stream") setResidual(null);
@@ -546,7 +746,7 @@ function Workbench(props: {
           const result = await api.activation(activeRun.id, primary.id);
           if (!cancelled) setActivation(result);
         } else if (activeTab === "Residual Stream") {
-          const result = await api.residualStream(activeRun.id);
+          const result = await api.residualStream(activeRun.id, residualPosition, residualTargetTokenId ?? undefined);
           if (!cancelled) setResidual(result);
         } else if (activeTab === "Logits" && activeRun.kind === "intervened" && activeRun.parentRunId) {
           const result = await api.compare(activeRun.parentRunId, activeRun.id);
@@ -560,7 +760,7 @@ function Workbench(props: {
     };
     void load();
     return () => { cancelled = true; };
-  }, [activeRun, activeTab, primary]);
+  }, [activeRun, activeRunArchived, activeTab, primary, residualPosition, residualTargetTokenId]);
 
   useEffect(() => {
     const handleKey = (event: KeyboardEvent) => {
@@ -682,9 +882,74 @@ function Workbench(props: {
     setNotice(`Saved ${ids.length} component${ids.length === 1 ? "" : "s"} as “${name}”.`);
   };
 
+  const saveRecipe = (name: string, kind: InterventionRecipe["kind"]) => {
+    const componentIds = selectedIntervenableIds();
+    if (!componentIds.length) return setNotice("Select one or more attention heads or MLPs before saving an intervention recipe.");
+    const recipe: InterventionRecipe = {
+      id: crypto.randomUUID(),
+      name,
+      kind,
+      componentIds,
+      tokenScope: scopedPositions ? "positions" : "all",
+      positions: scopedPositions ?? [],
+      targetToken,
+      distractorToken,
+      createdAt: new Date().toISOString(),
+    };
+    setRecipes((current) => [...current.filter((entry) => entry.name !== name), recipe]);
+    setRecipeDialog(false);
+    setNotice(`Saved intervention recipe “${name}”.`);
+  };
+
+  const runRecipe = async (recipe: InterventionRecipe) => {
+    commitSelection(recipe.componentIds);
+    try {
+      const positions = recipe.tokenScope === "positions" ? recipe.positions : null;
+      if (recipe.kind === "activation_patch") await patchActivations(recipe.componentIds, positions);
+      else await causalAblate(recipe.componentIds, recipe.kind, positions);
+      setActiveTab("Logits");
+      setNotice(`Completed intervention recipe “${recipe.name}”.`);
+    } catch (error) {
+      setNotice(error instanceof Error ? error.message : "Intervention recipe failed");
+    }
+  };
+
+  const runDatasetRecipe = async (seriesId: string, recipeId: string) => {
+    const series = experimentSeries.find((entry) => entry.id === seriesId);
+    const recipe = recipes.find((entry) => entry.id === recipeId);
+    if (!series) throw new Error("Choose a prompt-batch series first");
+    if (!recipe) throw new Error("Choose an intervention recipe first");
+    if (recipe.kind === "activation_patch") throw new Error("Dataset activation patching needs paired source and destination collections; use an ablation recipe here");
+    const liveBaselineIds = series.runIds.filter((runId) => runs.some((run) => run.id === runId && !archivedRunIds.has(run.id)));
+    if (liveBaselineIds.length !== series.runIds.length) {
+      throw new Error("This series contains archived run summaries. Rerun its prompt collection to recreate live tensors before applying dataset interventions");
+    }
+    const metricTarget = recipe.targetToken || targetToken;
+    if (!metricTarget) throw new Error("Set a single-token target metric before running the dataset experiment");
+    setDatasetLoading(true);
+    setEvidenceError(null);
+    setActiveTab("Experiments");
+    try {
+      const result = await api.datasetAblation(
+        liveBaselineIds,
+        recipe.componentIds,
+        recipe.kind,
+        recipe.tokenScope === "positions" ? recipe.positions : null,
+        { targetToken: metricTarget, distractorToken: recipe.distractorToken || distractorToken || undefined, position: -1 },
+      );
+      onDatasetAblation({ ...result, seriesId: series.id, seriesName: series.collectionName, recipeId: recipe.id, recipeName: recipe.name });
+      setNotice(`Completed ${result.summary.completedCount}/${result.summary.requestedCount} exact dataset interventions.`);
+    } catch (error) {
+      setEvidenceError(error instanceof Error ? error.message : "Dataset experiment failed");
+      throw error;
+    } finally {
+      setDatasetLoading(false);
+    }
+  };
+
   const snapshot = (name: string): WorkspaceSnapshot => ({
     format: "kannaadi-workspace",
-    version: 1,
+    version: 4,
     name,
     savedAt: new Date().toISOString(),
     modelId: model.id,
@@ -697,6 +962,16 @@ function Workbench(props: {
     expandedLayers: [...expanded],
     expandedHeads: [...expandedHeads],
     layout: { leftWidth, rightWidth, bottomHeight },
+    theme,
+    registeredModels: models.filter((entry) => entry.id !== DEFAULT_MODEL.id),
+    prompts,
+    collections,
+    experimentSeries,
+    recipes,
+    scratchpads,
+    codeCells,
+    results: { runs, contrast, effects, headSweep, mlpSweep, attribution, residual, datasetAblations },
+    viewport: { zoom, pan },
   });
 
   const saveCurrentWorkspace = async (name: string) => {
@@ -714,6 +989,7 @@ function Workbench(props: {
     try {
       const saved = await loadWorkspace(name);
       onRestoreWorkspace(saved);
+      onRestoreResearchState(saved);
       setSelection(saved.selection);
       setGroups(saved.groups);
       setExpanded(new Set(saved.expandedLayers));
@@ -721,7 +997,20 @@ function Workbench(props: {
       setLeftWidth(saved.layout.leftWidth);
       setRightWidth(saved.layout.rightWidth);
       setBottomHeight(saved.layout.bottomHeight);
-      setNotice(`Workspace “${saved.name}” restored. Run manifests are intentionally recomputed for the current model session.`);
+      if (saved.recipes) setRecipes(saved.recipes);
+      if (saved.scratchpads) setScratchpads(saved.scratchpads);
+      if (saved.codeCells) setCodeCells(saved.codeCells);
+      if (saved.results) {
+        setHeadSweep(saved.results.headSweep);
+        setMlpSweep(saved.results.mlpSweep);
+        setAttribution(saved.results.attribution);
+        setResidual(saved.results.residual);
+      }
+      if (saved.viewport) {
+        setZoom(saved.viewport.zoom);
+        setPan(saved.viewport.pan);
+      }
+      setNotice(`Workspace “${saved.name}” restored. Numeric results are available immediately; rerun prompts to recreate live activation tensors.`);
     } catch (error) {
       setNotice(error instanceof Error ? error.message : "Workspace could not be opened");
     }
@@ -736,7 +1025,29 @@ function Workbench(props: {
   return (
     <>
       <div className="workspace-grid" style={layoutStyle} onClick={() => contextMenu && setContextMenu(null)}>
-        <LeftSidebar selected={selectedNodes} architecture={architecture} runs={runs} activeRun={activeRun} onSelectRun={setActiveRunId} groups={groups} onSelectGroup={(group) => commitSelection(group.componentIds)} workspaceNames={workspaceNames} onOpenWorkspace={(name) => void openWorkspace(name)} onSaveWorkspace={() => setWorkspaceDialog(true)} onViewSelections={() => setSelectionDialog(true)} />
+        <LeftSidebar
+          selected={selectedNodes}
+          architecture={architecture}
+          prompts={prompts}
+          collections={collections}
+          activePromptId={activePromptId}
+          onSelectPrompt={onSelectPrompt}
+          onManagePrompts={onManagePrompts}
+          runs={runs}
+          archivedRunIds={archivedRunIds}
+          activeRun={activeRun}
+          onSelectRun={setActiveRunId}
+          onNewRun={onNewRun}
+          recipes={recipes}
+          onNewRecipe={() => setRecipeDialog(true)}
+          onRunRecipe={(recipe) => void runRecipe(recipe)}
+          groups={groups}
+          onSelectGroup={(group) => commitSelection(group.componentIds)}
+          workspaceNames={workspaceNames}
+          onOpenWorkspace={(name) => void openWorkspace(name)}
+          onSaveWorkspace={() => setWorkspaceDialog(true)}
+          onViewSelections={() => setSelectionDialog(true)}
+        />
         <PanelResizer label="Resize left sidebar" direction="vertical" onDelta={(delta) => setLeftWidth(clamp(leftWidth + delta, 160, 420))} onReset={() => setLeftWidth(220)} />
         <section className="center-stage">
           <ArchitecturePanel
@@ -775,10 +1086,27 @@ function Workbench(props: {
             selected={primary}
             model={model}
             prompt={prompt}
+            runs={runs}
+            experimentSeries={experimentSeries}
+            recipes={recipes}
+            datasetAblations={datasetAblations}
+            datasetLoading={datasetLoading}
+            scratchpad={scratchpads[model.id] ?? ""}
+            onScratchpadChange={(value) => setScratchpads((current) => ({ ...current, [model.id]: value }))}
+            codeCells={codeCells[model.id] ?? []}
+            onCodeCellsChange={(value) => setCodeCells((current) => ({ ...current, [model.id]: value }))}
+            selection={selection}
+            onRunsChanged={props.onRunsChanged}
             run={activeRun}
+            onSelectRun={setActiveRunId}
+            onDatasetRecipe={(seriesId, recipeId) => runDatasetRecipe(seriesId, recipeId)}
             attention={attention}
             activation={activation}
             residual={residual}
+            residualPosition={residualPosition}
+            setResidualPosition={setResidualPosition}
+            residualTargetTokenId={residualTargetTokenId}
+            setResidualTargetTokenId={setResidualTargetTokenId}
             comparison={comparison}
             contrast={contrast}
             effect={activeEffect}
@@ -792,7 +1120,7 @@ function Workbench(props: {
             onHeadSweep={(kind) => void sweepHeads(kind)}
             onMlpSweep={(kind) => void sweepMlps(kind)}
             onAttribution={() => void computeAttribution()}
-            onExport={() => downloadResearchBundle({ architecture, model, run: activeRun, contrast, effects, headSweep, mlpSweep, attribution, selection, groups })}
+            onExport={() => downloadResearchBundle({ architecture, model, run: activeRun, contrast, effects, headSweep, mlpSweep, attribution, datasetAblations, scratchpad: scratchpads[model.id] ?? "", codeCells: codeCells[model.id] ?? [], selection, groups })}
             loading={evidenceLoading}
             error={evidenceError}
           />
@@ -803,7 +1131,7 @@ function Workbench(props: {
           selected={primary}
           selectedCount={selection.length}
           activeRun={activeRun}
-          running={running}
+          running={running || activeRunArchived}
           onInspect={() => setActiveTab(primary?.kind === "head" ? "Attention" : "Activations")}
           scopePosition={scopePosition}
           setScopePosition={setScopePosition}
@@ -835,18 +1163,29 @@ function Workbench(props: {
       {contextMenu && <ContextMenu menu={contextMenu} run={activeRun} canPatch={Boolean(contrast)} onClose={() => setContextMenu(null)} onInspect={() => { selectNode(contextMenu.node); setActiveTab(contextMenu.node.kind === "head" ? "Attention" : "Activations"); setContextMenu(null); }} onExpand={() => { const node = contextMenu.node; if (node.layer != null) setExpanded(new Set([...expanded, node.layer])); if (node.kind === "head") setExpandedHeads(new Set([...expandedHeads, node.id])); selectNode(node); setContextMenu(null); }} onAblate={() => { const node = contextMenu.node; selectNode(node); setContextMenu(null); window.setTimeout(() => void causalAblate([node.id], "zero_ablation", scopedPositions), 0); }} onPatch={() => { const node = contextMenu.node; selectNode(node); setContextMenu(null); window.setTimeout(() => void patchActivations([node.id], scopedPositions), 0); }} onAction={setNotice} />}
       {notice && <div className="toast" role="status"><Info size={15} />{notice}<button aria-label="Dismiss" onClick={() => setNotice(null)}><X /></button></div>}
       {groupDialog && <NameDialog title="Save component group" description="Reuse this head selection for batch interventions and workspace snapshots." action="Save group" onClose={() => setGroupDialog(false)} onSubmit={saveGroup} />}
-      {workspaceDialog && <NameDialog title="Save workspace" description="Saves prompts, metric, selections, groups, expanded components, and panel layout." action="Save workspace" onClose={() => setWorkspaceDialog(false)} onSubmit={(name) => void saveCurrentWorkspace(name)} />}
+      {recipeDialog && <InterventionRecipeDialog selected={selectedNodes} defaultPositions={scopedPositions ?? []} onClose={() => setRecipeDialog(false)} onSave={saveRecipe} />}
+      {workspaceDialog && <NameDialog title="Save workspace" description="Saves the model registration, prompt library, experiment setup, reusable interventions, result summaries, viewport, selections, and panel layout." action="Save workspace" onClose={() => setWorkspaceDialog(false)} onSubmit={(name) => void saveCurrentWorkspace(name)} />}
       {selectionDialog && <SelectionDialog nodes={selectedNodes} onRemove={(id) => commitSelection(selection.filter((item) => item !== id))} onClear={() => commitSelection([])} onClose={() => setSelectionDialog(false)} />}
     </>
   );
 }
 
-function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun, groups, onSelectGroup, workspaceNames, onOpenWorkspace, onSaveWorkspace, onViewSelections }: {
+function LeftSidebar({ selected, architecture, prompts, collections, activePromptId, onSelectPrompt, onManagePrompts, runs, archivedRunIds, activeRun, onSelectRun, onNewRun, recipes, onNewRecipe, onRunRecipe, groups, onSelectGroup, workspaceNames, onOpenWorkspace, onSaveWorkspace, onViewSelections }: {
   selected: ComponentNode[];
   architecture: ArchitectureGraph | null;
+  prompts: PromptEntry[];
+  collections: PromptCollection[];
+  activePromptId: string;
+  onSelectPrompt: (promptId: string) => void;
+  onManagePrompts: () => void;
   runs: RunRecord[];
+  archivedRunIds: Set<string>;
   activeRun: RunRecord | null;
   onSelectRun: (runId: string) => void;
+  onNewRun: () => void;
+  recipes: InterventionRecipe[];
+  onNewRecipe: () => void;
+  onRunRecipe: (recipe: InterventionRecipe) => void;
   groups: ComponentGroup[];
   onSelectGroup: (group: ComponentGroup) => void;
   workspaceNames: string[];
@@ -857,14 +1196,19 @@ function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun, gro
   return (
     <aside className="left-sidebar panel">
       <div className="sidebar-scroll">
-      <SidebarSection title="Prompts" icon={<FileJson />}><button className="side-item active">The capital of France is</button></SidebarSection>
-      <SidebarSection title="Runs" icon={<History />}>
-        {runs.map((run) => <button className={`side-item run-item ${activeRun?.id === run.id ? "active" : ""}`} key={run.id} onClick={() => onSelectRun(run.id)}><i className={`status-dot ${run.kind}`} /><span>{run.label}</span><small>{run.durationMs.toFixed(0)} ms</small></button>)}
+      <SidebarSection title="Prompts" icon={<FileJson />} onAdd={onManagePrompts} addLabel="Manage prompts and collections">
+        {prompts.map((entry) => <button className={`side-item ${activePromptId === entry.id ? "active" : ""}`} key={entry.id} title={entry.text} onClick={() => onSelectPrompt(entry.id)}><FileJson /><span>{entry.name}</span></button>)}
+        {collections.map((entry) => <button className="side-item collection-item" key={entry.id} onClick={onManagePrompts}><Library /><span>{entry.name}</span><small>{entry.promptIds.length} prompts</small></button>)}
+        {!prompts.length && <div className="empty-side">Create a prompt or prompt collection</div>}
+      </SidebarSection>
+      <SidebarSection title="Runs" icon={<History />} onAdd={onNewRun} addLabel="Start a run or batch">
+        {runs.map((run) => <button className={`side-item run-item ${activeRun?.id === run.id ? "active" : ""}`} key={run.id} onClick={() => onSelectRun(run.id)}><i className={`status-dot ${run.kind}`} /><span>{run.label}</span><small>{archivedRunIds.has(run.id) ? "saved" : `${run.durationMs.toFixed(0)} ms`}</small></button>)}
         {!runs.length && <div className="empty-side"><i className="status-dot muted" />Run a prompt to begin</div>}
       </SidebarSection>
-      <SidebarSection title="Interventions" icon={<Sparkles />}>
+      <SidebarSection title="Interventions" icon={<Sparkles />} onAdd={onNewRecipe} addLabel="Save an intervention recipe">
+        {recipes.map((recipe) => <button className="side-item recipe-item" key={recipe.id} onClick={() => onRunRecipe(recipe)}><Sparkles /><span>{recipe.name}</span><small>{recipe.componentIds.length} components</small></button>)}
         {runs.filter((run) => run.kind === "intervened" || run.kind === "patched").map((run) => <button className="side-item" key={run.id} onClick={() => onSelectRun(run.id)}><span>{run.interventions[0]?.kind.replaceAll("_", " ")}</span><small>{run.interventions[0]?.componentIds.map(shortComponentId).join(", ")}</small></button>)}
-        {!runs.some((run) => run.kind === "intervened" || run.kind === "patched") && <div className="empty-side">No interventions yet</div>}
+        {!recipes.length && !runs.some((run) => run.kind === "intervened" || run.kind === "patched") && <div className="empty-side">Select components, then save or run an intervention</div>}
       </SidebarSection>
       <SidebarSection title={`Selections (${selected.length})`} icon={<Layers3 />}>
         {selected.slice(-4).map((node) => <button className="side-item selection-item" key={node.id}><ComponentGlyph kind={node.kind} />{displayName(node)}</button>)}
@@ -875,7 +1219,7 @@ function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun, gro
         {groups.map((group) => <button className="side-item" key={group.id} onClick={() => onSelectGroup(group)}><span>{group.name}</span><small>{group.componentIds.length} components</small></button>)}
         {!groups.length && <div className="empty-side">Save a selection to reuse it</div>}
       </SidebarSection>
-      <SidebarSection title="Workspaces" icon={<Database />}>
+      <SidebarSection title="Workspaces" icon={<Database />} onAdd={onSaveWorkspace} addLabel="Create workspace snapshot">
         {workspaceNames.map((name) => <button className="side-item" key={name} onClick={() => onOpenWorkspace(name)}><FolderOpen />{name}</button>)}
       </SidebarSection>
       </div>
@@ -887,8 +1231,8 @@ function LeftSidebar({ selected, architecture, runs, activeRun, onSelectRun, gro
   );
 }
 
-function SidebarSection({ title, icon, children }: { title: string; icon: ReactNode; children: ReactNode }) {
-  return <section className="sidebar-section"><header><span>{title}</span></header><div className="sidebar-section-icon">{icon}</div>{children}</section>;
+function SidebarSection({ title, icon, children, onAdd, addLabel }: { title: string; icon: ReactNode; children: ReactNode; onAdd?: () => void; addLabel?: string }) {
+  return <section className="sidebar-section"><header><span>{title}</span>{onAdd && <button type="button" aria-label={addLabel ?? `Add ${title}`} title={addLabel ?? `Add ${title}`} onClick={onAdd}><Plus /></button>}</header><div className="sidebar-section-icon">{icon}</div>{children}</section>;
 }
 
 function ArchitecturePanel(props: {
@@ -924,6 +1268,7 @@ function ArchitecturePanel(props: {
   const content = useRef<HTMLDivElement>(null);
   const zoomRef = useRef(zoom);
   const panRef = useRef(pan);
+  const gestureZoom = useRef(zoom);
   const drag = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
   const [box, setBox] = useState<{ x1: number; y1: number; x2: number; y2: number } | null>(null);
 
@@ -965,8 +1310,9 @@ function ArchitecturePanel(props: {
     if (!element) return;
     const wheel = (event: WheelEvent) => {
       event.preventDefault();
-      if (event.ctrlKey) {
-        zoomAt(zoomRef.current * Math.exp(-event.deltaY * 0.012), event.clientX, event.clientY);
+      if (event.ctrlKey || event.metaKey) {
+        const sensitivity = event.deltaMode === WheelEvent.DOM_DELTA_PIXEL ? 0.012 : 0.08;
+        zoomAt(zoomRef.current * Math.exp(-event.deltaY * sensitivity), event.clientX, event.clientY);
       } else {
         const current = panRef.current;
         const next = { x: current.x - event.deltaX, y: current.y - event.deltaY };
@@ -974,8 +1320,24 @@ function ArchitecturePanel(props: {
         setPan(next);
       }
     };
-    element.addEventListener("wheel", wheel, { passive: false });
-    return () => element.removeEventListener("wheel", wheel);
+    type GestureEventLike = Event & { scale?: number; clientX?: number; clientY?: number };
+    const gestureStart = (event: Event) => {
+      event.preventDefault();
+      gestureZoom.current = zoomRef.current;
+    };
+    const gestureChange = (event: Event) => {
+      event.preventDefault();
+      const gesture = event as GestureEventLike;
+      zoomAt(gestureZoom.current * (gesture.scale ?? 1), gesture.clientX, gesture.clientY);
+    };
+    element.addEventListener("wheel", wheel, { passive: false, capture: true });
+    element.addEventListener("gesturestart", gestureStart, { passive: false });
+    element.addEventListener("gesturechange", gestureChange, { passive: false });
+    return () => {
+      element.removeEventListener("wheel", wheel, true);
+      element.removeEventListener("gesturestart", gestureStart);
+      element.removeEventListener("gesturechange", gestureChange);
+    };
   }, [setPan, zoomAt]);
 
   const pointerDown = (event: ReactPointerEvent<HTMLDivElement>) => {
@@ -1036,7 +1398,7 @@ function ArchitecturePanel(props: {
         {!architecture ? <CanvasEmpty error={error} connected={connected} runtime={runtime} loading={loading} onRetry={onRetry} /> : (
           <div ref={content} className={`architecture-content semantic-${zoom < .25 ? "far" : zoom < .55 ? "mid" : "near"}`} style={{ transform: `translate(${pan.x}px, ${pan.y}px) scale(${zoom})` }}>
             <ModelBoundaryRow mode="output" architecture={architecture} selection={selection} selectNode={selectNode} />
-            <div className="column-labels"><span>Layer</span><span>Residual Stream</span><span>Attention</span><span>MLP</span><span>Residual Stream</span></div>
+            <div className={`column-labels ${architecture.blockTopology}`}><span>Layer</span><span>Residual input</span><span>{architecture.blockTopology === "parallel" ? "Parallel attention + MLP branches" : "Attention"}</span><span>{architecture.blockTopology === "parallel" ? "Joint merge" : "MLP"}</span><span>Residual output</span></div>
             {[...architecture.layers].reverse().map((layer) => (
               <LayerRow
                 key={layer.id}
@@ -1069,9 +1431,11 @@ function ModelBoundaryRow({ mode, architecture, selection, selectNode }: {
   selection: string[];
   selectNode: (node: ComponentNode, additive?: boolean) => void;
 }) {
-  const nodes = mode === "input" ? [architecture.embedding, architecture.positionalEmbedding].filter(Boolean) as ComponentNode[] : [architecture.finalNorm, architecture.unembedding];
   const additive = (event: React.MouseEvent) => event.shiftKey || event.ctrlKey || event.metaKey;
-  return <div className={`model-boundary-row ${mode}`}><span>{mode === "input" ? "Input / initialization" : "Output / readout"}</span><div>{mode === "input" && <span className="outside-model-node">Prompt → tokenizer <small>outside model</small></span>}{mode === "output" && <span className="residual-boundary-node">final residual x<sub>L</sub> →</span>}{nodes.map((node) => <button key={node.id} data-component-id={node.id} className={selection.includes(node.id) ? "component-selected" : ""} onClick={(event) => selectNode(node, additive(event))}><ComponentGlyph kind={node.kind} />{node.label}<small>{node.activationPoints[0]}</small></button>)}{mode === "input" && <span className="residual-boundary-node">sum once → initial residual x₀</span>}{mode === "output" && <span className="logits-node">Vocabulary logits · {architecture.vocabularySize.toLocaleString()}</span>}</div></div>;
+  const addsPositionToResidual = Boolean(architecture.positionalEmbedding && architecture.positionalMechanism === "standard");
+  const component = (node: ComponentNode) => <button key={node.id} data-component-id={node.id} className={selection.includes(node.id) ? "component-selected" : ""} onClick={(event) => selectNode(node, additive(event))}><ComponentGlyph kind={node.kind} />{node.label}<small>{node.activationPoints[0]}</small></button>;
+  if (mode === "output") return <div className="model-boundary-row output"><span>Output / readout</span><div className="boundary-linear-flow"><span className="residual-boundary-node">final residual x<sub>L</sub></span><i>→</i>{component(architecture.finalNorm)}<i>→</i>{component(architecture.unembedding)}<i>→</i><span className="logits-node">Vocabulary logits <small>{architecture.vocabularySize.toLocaleString()} tokens</small></span></div></div>;
+  return <div className="model-boundary-row input"><span>Input / initialization</span><div className="input-boundary-flow"><span className="outside-model-node">Prompt <i>→</i> tokenizer <i>→</i> token IDs <small>outside model</small></span><i>→</i><div className="boundary-branches"><div><small>token IDs</small>{component(architecture.embedding)}</div>{architecture.positionalEmbedding ? <div><small>position indices</small>{component(architecture.positionalEmbedding)}</div> : <div className="position-mechanism"><small>position indices</small><span>{architecture.positionalMechanism}<b>applied inside attention</b></span></div>}</div>{addsPositionToResidual ? <><span className="boundary-sum" title="Added once to form the initial residual stream">+</span><span className="residual-boundary-node">initial residual x<sub>0</sub></span></> : <><i>→</i><span className="residual-boundary-node">initial residual x<sub>0</sub><small>{architecture.positionalMechanism === "shortformer" ? "position signal enters attention" : "token embedding only"}</small></span></>}</div></div>;
 }
 
 function LayerRow({ layer, architecture, expanded, expandedHeads, selected, toggle, toggleHead, selectNode, contextNode, headOverlay, mlpOverlay }: {
@@ -1092,6 +1456,28 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
   const choose = (node: ComponentNode, event: React.MouseEvent) => { event.stopPropagation(); selectNode(node, event.shiftKey || event.ctrlKey || event.metaKey); };
   const mlpEffect = mlpOverlay?.effects.find((value) => value.componentId === layer.mlp.id);
   const context = (node: ComponentNode, event: React.MouseEvent) => { event.preventDefault(); event.stopPropagation(); contextNode(node, event.clientX, event.clientY); };
+  if (architecture.blockTopology === "parallel") return (
+    <article className={`parallel-layer-row ${expanded ? "expanded" : ""} ${openHead ? "head-expanded" : ""} ${layerSelected ? "layer-selected" : ""}`}>
+      <button className="layer-index" onClick={toggle} aria-label={`${expanded ? "Collapse" : "Expand"} layer ${layer.index}`}><strong>{layer.index}</strong>{expanded ? <ChevronDown /> : <ChevronRight />}</button>
+      <div className="parallel-residual-source"><button data-component-id={layer.residualPre.id} title={layer.residualPre.id} onClick={(event) => choose(layer.residualPre, event)}>x<sub>{layer.index}</sub></button><span /></div>
+      <div className="parallel-branches">
+        <div className="attention-stage">
+          {expanded && <button className={`norm-chip ${selected.includes(layer.norm1.id) ? "component-selected" : ""}`} data-component-id={layer.norm1.id} onClick={(event) => choose(layer.norm1, event)}>{architecture.normType}</button>}
+          <button data-component-id={layer.attention.id} className={`attention-block ${selected.includes(layer.attention.id) ? "component-selected" : ""}`} onClick={(event) => choose(layer.attention, event)} onContextMenu={(event) => context(layer.attention, event)}><span>{expanded ? `Layer ${layer.index} attention` : "Multi-Head Attention"}</span>{expanded && <small>{architecture.nHeads} query heads · {architecture.nKeyValueHeads} KV heads</small>}</button>
+          {expanded && <div className="heads-container" style={{ "--heads": architecture.nHeads } as CSSProperties}>{layer.heads.map((head) => { const effect = headOverlay?.effects.find((value) => value.componentId === head.id); return <button key={head.id} data-component-id={head.id} className={`${selected.includes(head.id) ? "component-selected" : ""} ${effect ? "causal-overlay" : ""}`} style={effect ? causalOverlayStyle(effect.delta, Math.max(Math.abs(headOverlay!.minimum), Math.abs(headOverlay!.maximum))) : undefined} title={effect ? `${shortComponentId(head.id)}: ${signed(effect.delta)} metric change` : head.id} onClick={(event) => choose(head, event)} onDoubleClick={() => toggleHead(head.id)} onContextMenu={(event) => context(head, event)} aria-label={`Select L${layer.index}H${head.head}`}>H{head.head}{effect && <small>{signedCompact(effect.delta)}</small>}</button>; })}</div>}
+          {expanded && openHead && <div className="head-internals"><header><span>{displayName(openHead)}</span><button onClick={() => toggleHead(openHead.id)}><X /></button></header><div>{openHead.children.map((child, index) => <span key={child.id}><button data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>{index < openHead.children.length - 1 && <i>→</i>}</span>)}</div></div>}
+        </div>
+        <div className="mlp-stage">
+          {expanded && <button className={`norm-chip ${selected.includes(layer.norm2.id) ? "component-selected" : ""}`} data-component-id={layer.norm2.id} onClick={(event) => choose(layer.norm2, event)}>{architecture.normType}</button>}
+          <button data-component-id={layer.mlp.id} className={`mlp-block ${selected.includes(layer.mlp.id) ? "component-selected" : ""} ${mlpEffect ? "causal-overlay" : ""}`} style={mlpEffect ? causalOverlayStyle(mlpEffect.delta, Math.max(Math.abs(mlpOverlay!.minimum), Math.abs(mlpOverlay!.maximum))) : undefined} title={mlpEffect ? `MLP L${layer.index}: ${signed(mlpEffect.delta)} metric change` : layer.mlp.id} onClick={(event) => choose(layer.mlp, event)} onContextMenu={(event) => context(layer.mlp, event)}>{expanded ? `MLP (${architecture.dMlp ?? "hidden"})` : "MLP"}{mlpEffect && <small>{signedCompact(mlpEffect.delta)}</small>}</button>
+          {expanded && <div className="mlp-internals">{layer.mlp.children.map((child) => <button key={child.id} data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>)}</div>}
+        </div>
+      </div>
+      <div className="parallel-merge"><span>attn out</span><span>MLP out</span><button data-component-id={layer.residualMid.id} title="Attention and MLP outputs are added jointly to the input residual" onClick={(event) => choose(layer.residualMid, event)}><Plus /></button></div>
+      <div className="parallel-residual-output"><span /><button data-component-id={layer.residualPost.id} title={layer.residualPost.id} onClick={(event) => choose(layer.residualPost, event)}>x<sub>{layer.index + 1}</sub></button></div>
+      <button className="row-more" onClick={(event) => context(layer.residualPost, event)} onContextMenu={(event) => context(layer.residualPost, event)} aria-label={`More actions for layer ${layer.index}`}><EllipsisVertical /></button>
+    </article>
+  );
   return (
     <article className={`layer-row ${expanded ? "expanded" : ""} ${openHead ? "head-expanded" : ""} ${layerSelected ? "layer-selected" : ""}`}>
       <button className="layer-index" onClick={toggle} aria-label={`${expanded ? "Collapse" : "Expand"} layer ${layer.index}`}><strong>{layer.index}</strong>{expanded ? <ChevronDown /> : <ChevronRight />}</button>
@@ -1201,10 +1587,27 @@ function AnalysisPanel(props: {
   selected: ComponentNode | null;
   model: ModelCatalogEntry;
   prompt: string;
+  runs: RunRecord[];
+  experimentSeries: ExperimentSeries[];
+  recipes: InterventionRecipe[];
+  datasetAblations: DatasetAblationResult[];
+  datasetLoading: boolean;
+  scratchpad: string;
+  onScratchpadChange: (value: string) => void;
+  codeCells: CodeCell[];
+  onCodeCellsChange: (cells: CodeCell[]) => void;
+  selection: string[];
+  onRunsChanged: (runs: RunRecord[]) => void;
   run: RunRecord | null;
+  onSelectRun: (runId: string) => void;
+  onDatasetRecipe: (seriesId: string, recipeId: string) => Promise<void>;
   attention: AttentionResult | null;
   activation: ActivationSeries | null;
   residual: ResidualStreamResult | null;
+  residualPosition: number;
+  setResidualPosition: (position: number) => void;
+  residualTargetTokenId: number | null;
+  setResidualTargetTokenId: (tokenId: number | null) => void;
   comparison: RunComparison | null;
   contrast: ContrastResult | null;
   effect: CausalEffect | null;
@@ -1222,10 +1625,11 @@ function AnalysisPanel(props: {
   loading: boolean;
   error: string | null;
 }) {
-  const { activeTab, setActiveTab, architecture, selected, model, prompt, run, attention, activation, residual, comparison, contrast, effect, headSweep, mlpSweep, sweepKind, setSweepKind, attribution, sweepLoading, attributionLoading, onHeadSweep, onMlpSweep, onAttribution, onExport, loading, error } = props;
-  const tabs: PanelTab[] = ["Tokens", "Alignment", "Attention", "QK / OV", "Logits", "Activations", "Residual Stream", "Causal Sweep", "Attribution", "Code"];
+  const { activeTab, setActiveTab, architecture, selected, model, prompt, runs, experimentSeries, recipes, datasetAblations, datasetLoading, scratchpad, onScratchpadChange, codeCells, onCodeCellsChange, selection, onRunsChanged, run, onSelectRun, onDatasetRecipe, attention, activation, residual, residualPosition, setResidualPosition, residualTargetTokenId, setResidualTargetTokenId, comparison, contrast, effect, headSweep, mlpSweep, sweepKind, setSweepKind, attribution, sweepLoading, attributionLoading, onHeadSweep, onMlpSweep, onAttribution, onExport, loading, error } = props;
+  const tabs: PanelTab[] = ["Tokens", "Experiments", "Alignment", "Attention", "QK / OV", "Logits", "Activations", "Residual Stream", "Causal Sweep", "Attribution", "Code"];
   let content: ReactNode;
-  if (activeTab === "Code") content = <CodePanel architecture={architecture} selected={selected} model={model} prompt={prompt} run={run} />;
+  if (activeTab === "Code") content = <IntegratedCodePanel architecture={architecture} selected={selected} selection={selection} model={model} prompt={prompt} run={run} scratchpad={scratchpad} onScratchpadChange={onScratchpadChange} cells={codeCells} onCellsChange={onCodeCellsChange} onRunsChanged={onRunsChanged} />;
+  else if (activeTab === "Experiments") content = <ExperimentsPanel runs={runs} activeRun={run} onSelectRun={onSelectRun} series={experimentSeries} recipes={recipes} results={datasetAblations} loading={datasetLoading} onRunDataset={onDatasetRecipe} />;
   else if (activeTab === "Alignment") content = contrast ? <AlignmentPanel contrast={contrast} /> : <EvidencePrompt message="Open Contrast setup and run a clean/corrupted prompt pair to inspect token alignment." />;
   else if (activeTab === "Causal Sweep" && sweepLoading) content = <EvidenceLoading message={`Running exact batched ${sweepKind === "heads" ? "attention-head" : "MLP"} interventions…`} />;
   else if (activeTab === "Causal Sweep") content = <SweepWorkspace headResult={headSweep} mlpResult={mlpSweep} kind={sweepKind} setKind={setSweepKind} onHeadSweep={onHeadSweep} onMlpSweep={onMlpSweep} disabled={!run} />;
@@ -1239,7 +1643,7 @@ function AnalysisPanel(props: {
   else if (activeTab === "QK / OV") content = attention ? <QkovPanel result={attention} /> : <EvidencePrompt message="Select an attention head to inspect QK scores and projected result strength." />;
   else if (activeTab === "Logits") content = <LogitsPanel run={run} comparison={comparison} effect={effect} />;
   else if (activeTab === "Activations") content = activation ? <ActivationPanel result={activation} /> : <EvidencePrompt message="Select a component with a cached activation." />;
-  else content = residual ? <ResidualPanel result={residual} /> : <EvidencePrompt message="Residual-stream evidence is available after a run." />;
+  else content = residual && run ? <ResidualPanel result={residual} selected={selected} run={run} position={residualPosition} setPosition={setResidualPosition} targetTokenId={residualTargetTokenId} setTargetTokenId={setResidualTargetTokenId} /> : <EvidencePrompt message="Select any residual-stream point after a run to inspect its vocabulary readout." />;
   return <section className="analysis-panel panel"><nav>{tabs.map((tab) => <button className={activeTab === tab ? "active" : ""} key={tab} onClick={() => setActiveTab(tab)}>{tab}</button>)}<button className="export-bundle" onClick={onExport} disabled={!run} title="Download a reproducible research bundle"><Download />Export</button></nav><div className="analysis-content">{content}</div></section>;
 }
 
@@ -1323,16 +1727,70 @@ function ActivationPanel({ result }: { result: ActivationSeries }) {
   return <div className="activation-panel"><header><div><strong>{shortComponentId(result.componentId)} activation magnitude</strong><code>{result.hookName}</code></div><span>{result.measure.replaceAll("_", " ")} · axis: {result.axes.join(", ")}</span></header><div>{result.values.map((value, index) => <div className="activation-row" key={index}><span>{index}</span><code>{result.tokenLabels[index]}</code><i><b style={{ width: `${value / maximum * 100}%` }} /></i><strong>{value.toFixed(3)}</strong></div>)}</div></div>;
 }
 
-function ResidualPanel({ result }: { result: ResidualStreamResult }) {
-  const points = result.points.filter((point) => point.stage === "post");
+function ResidualPanel({ result, selected, run, position, setPosition, targetTokenId, setTargetTokenId }: { result: ResidualStreamResult; selected: ComponentNode | null; run: RunRecord; position: number; setPosition: (position: number) => void; targetTokenId: number | null; setTargetTokenId: (tokenId: number | null) => void }) {
+  const selectedMatch = selected?.id.match(/^blocks\.(\d+)\.resid_(pre|mid|post)$/);
+  const selectedFromCanvas = selectedMatch ? `${selectedMatch[1]}:${selectedMatch[2]}` : null;
+  const [chosenKey, setChosenKey] = useState<string | null>(selectedFromCanvas);
+  useEffect(() => { if (selectedFromCanvas) setChosenKey(selectedFromCanvas); }, [selectedFromCanvas]);
+  const points = result.points;
+  const availableStages = new Set(points.map((point) => point.stage));
+  const chosen = points.find((point) => `${point.layer}:${point.stage}` === chosenKey) ?? points.at(-1)!;
   const width = 720, height = 180, padX = 40, padY = 25;
   const logits = points.map((point) => point.targetLogit);
   const min = Math.min(...logits), max = Math.max(...logits), range = max - min || 1;
   const coords = points.map((point, index) => `${padX + index / Math.max(points.length - 1, 1) * (width - padX * 2)},${height - padY - (point.targetLogit - min) / range * (height - padY * 2)}`).join(" ");
-  return <div className="residual-panel"><header><div><strong>Logit lens through the residual stream</strong><span>Target <code>{visibleToken(result.targetToken)}</code> at position {result.position}</span></div><small>Final normalization and unembedding applied at each layer</small></header><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Target-token logit by layer">{[0, .5, 1].map((fraction) => <line key={fraction} x1={padX} x2={width - padX} y1={padY + fraction * (height - padY * 2)} y2={padY + fraction * (height - padY * 2)} />)}<polyline points={coords} />{points.map((point, index) => { const x = padX + index / Math.max(points.length - 1, 1) * (width - padX * 2); const y = height - padY - (point.targetLogit - min) / range * (height - padY * 2); return <g key={point.layer}><circle cx={x} cy={y} r="3" /><text x={x} y={height - 7}>L{point.layer}</text><title>Layer {point.layer}: {point.targetLogit.toFixed(4)}</title></g>; })}</svg><div className="residual-summary"><span>Initial <strong>{logits[0]?.toFixed(3)}</strong></span><span>Final <strong>{logits.at(-1)?.toFixed(3)}</strong></span><span>Change <strong>{signed((logits.at(-1) ?? 0) - (logits[0] ?? 0))}</strong></span></div></div>;
+  return <div className="residual-panel"><header><div><strong>Residual vocabulary readout</strong><span>Target <code>{visibleToken(result.targetToken)}</code> at position {result.position}</span></div><div className="residual-controls"><label><span>Prompt position</span><select aria-label="Residual readout position" value={position} onChange={(event) => setPosition(Number(event.target.value))}><option value={-1}>Final: {run.tokens.at(-1)?.display}</option>{run.tokens.map((token) => <option value={token.position} key={token.position}>{token.position}: {token.display}</option>)}</select></label><label><span>Tracked token</span><select aria-label="Residual tracked token" value={targetTokenId ?? "auto"} onChange={(event) => setTargetTokenId(event.target.value === "auto" ? null : Number(event.target.value))}><option value="auto">Auto: final top token</option>{run.topPredictions.map((prediction) => <option value={prediction.tokenId} key={prediction.tokenId}>{prediction.display}</option>)}</select></label></div><small>Diagnostic final-norm + unembedding readout; the forward pass is unchanged.</small></header><div className="residual-workspace"><section><svg viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Target-token logit through every residual-stream point">{[0, .5, 1].map((fraction) => <line key={fraction} x1={padX} x2={width - padX} y1={padY + fraction * (height - padY * 2)} y2={padY + fraction * (height - padY * 2)} />)}<polyline points={coords} />{points.map((point, index) => { const key = `${point.layer}:${point.stage}`; const active = key === `${chosen.layer}:${chosen.stage}`; const x = padX + index / Math.max(points.length - 1, 1) * (width - padX * 2); const y = height - padY - (point.targetLogit - min) / range * (height - padY * 2); return <g className={`${point.stage} ${active ? "active" : ""}`} key={key} role="button" tabIndex={0} onClick={() => setChosenKey(key)} onKeyDown={(event) => (event.key === "Enter" || event.key === " ") && setChosenKey(key)}><circle cx={x} cy={y} r={active ? "5" : "3"} /><text x={x} y={height - 7}>{point.stage === "post" ? `L${point.layer}` : ""}</text><title>Layer {point.layer} residual {point.stage}: {point.targetLogit.toFixed(4)}</title></g>; })}</svg><div className="residual-legend">{availableStages.has("pre") && <span className="pre">block input</span>}{availableStages.has("mid") && <span className="mid">post-attention</span>}{availableStages.has("post") && <span className="post">block output</span>}</div></section><aside className="residual-readout"><header><div><small>Selected residual point</small><strong>L{chosen.layer} · {chosen.stage}</strong></div><code>blocks.{chosen.layer}.resid_{chosen.stage}</code></header><dl><div><dt>Target logit</dt><dd>{chosen.targetLogit.toFixed(4)}</dd></div><div><dt>Vector L2 norm</dt><dd>{chosen.norm.toFixed(4)}</dd></div><div><dt>Vocabulary entropy</dt><dd>{chosen.entropy.toFixed(4)}</dd></div></dl><h4>Top decoded tokens</h4>{chosen.topPredictions.map((prediction, index) => <div className="residual-prediction" key={prediction.tokenId}><span>{index + 1}</span><code>{prediction.display}</code><i><b style={{ width: `${prediction.probability / (chosen.topPredictions[0]?.probability || 1) * 100}%` }} /></i><strong>{formatPercent(prediction.probability)}</strong></div>)}</aside></div><div className="residual-summary"><span>Initial <strong>{logits[0]?.toFixed(3)}</strong></span><span>Final <strong>{logits.at(-1)?.toFixed(3)}</strong></span><span>Change <strong>{signed((logits.at(-1) ?? 0) - (logits[0] ?? 0))}</strong></span></div></div>;
 }
 
-function CodePanel({ architecture, selected, model, prompt, run }: { architecture: ArchitectureGraph | null; selected: ComponentNode | null; model: ModelCatalogEntry; prompt: string; run: RunRecord | null }) {
+function ExperimentsPanel({ runs, activeRun, onSelectRun, series, recipes, results, loading, onRunDataset }: { runs: RunRecord[]; activeRun: RunRecord | null; onSelectRun: (runId: string) => void; series: ExperimentSeries[]; recipes: InterventionRecipe[]; results: DatasetAblationResult[]; loading: boolean; onRunDataset: (seriesId: string, recipeId: string) => Promise<void> }) {
+  const [baselineId, setBaselineId] = useState(runs[1]?.id ?? runs[0]?.id ?? "");
+  const [candidateId, setCandidateId] = useState(runs[0]?.id ?? "");
+  const [mode, setMode] = useState<"runs" | "dataset">(series.length || results.length ? "dataset" : "runs");
+  const ablationRecipes = recipes.filter((recipe) => recipe.kind !== "activation_patch");
+  const [seriesId, setSeriesId] = useState(series[0]?.id ?? "");
+  const [recipeId, setRecipeId] = useState(ablationRecipes[0]?.id ?? "");
+  const [resultId, setResultId] = useState(results[0]?.id ?? "");
+  const [datasetError, setDatasetError] = useState<string | null>(null);
+  const baseline = runs.find((run) => run.id === baselineId) ?? runs[1] ?? runs[0];
+  const candidate = runs.find((run) => run.id === candidateId) ?? runs[0];
+  const result = results.find((entry) => entry.id === resultId) ?? results[0];
+  const tokenIds = [...new Set([...(baseline?.topPredictions ?? []), ...(candidate?.topPredictions ?? [])].map((prediction) => prediction.tokenId))];
+  const probability = (run: RunRecord | undefined, tokenId: number) => run?.topPredictions.find((prediction) => prediction.tokenId === tokenId)?.probability;
+  const display = (tokenId: number) => baseline?.topPredictions.find((prediction) => prediction.tokenId === tokenId)?.display ?? candidate?.topPredictions.find((prediction) => prediction.tokenId === tokenId)?.display ?? String(tokenId);
+  const submitDataset = async () => {
+    setDatasetError(null);
+    try {
+      await onRunDataset(seriesId, recipeId);
+      setMode("dataset");
+    } catch (error) {
+      setDatasetError(error instanceof Error ? error.message : "Dataset experiment failed");
+    }
+  };
+  if (mode === "dataset") return <DatasetExperiments series={series} recipes={ablationRecipes} results={results} result={result} seriesId={seriesId} setSeriesId={setSeriesId} recipeId={recipeId} setRecipeId={setRecipeId} resultId={resultId} setResultId={setResultId} loading={loading} error={datasetError} onRun={() => void submitDataset()} onSelectRun={onSelectRun} onShowRuns={() => setMode("runs")} />;
+  if (!runs.length) return <EvidencePrompt message="Run a prompt or prompt collection to populate the experiment table." />;
+  return <div className="experiments-panel"><header><div><strong>Experiment runs</strong><span>Compare output summaries across prompt batches, baselines, and interventions.</span></div><small>{runs.length} run{runs.length === 1 ? "" : "s"}</small></header><div className="experiment-results"><section><table><thead><tr><th>Run</th><th>Kind</th><th>Prompt</th><th>Top prediction</th><th>Probability</th><th>Tokens</th><th>Runtime</th></tr></thead><tbody>{runs.map((run) => <tr className={activeRun?.id === run.id ? "active" : ""} key={run.id} onClick={() => onSelectRun(run.id)}><td><strong>{run.label}</strong></td><td><span className={`run-kind ${run.kind}`}>{run.kind}</span></td><td title={run.prompt}>{run.prompt}</td><td><code>{run.topPredictions[0]?.display ?? "—"}</code></td><td>{formatPercent(run.topPredictions[0]?.probability ?? 0)}</td><td>{run.tokens.length}</td><td>{run.durationMs.toFixed(0)} ms</td></tr>)}</tbody></table></section><aside><h3>Compare saved output summaries</h3><div className="compare-selectors"><label><span>Baseline</span><select value={baseline?.id ?? ""} onChange={(event) => setBaselineId(event.target.value)}>{runs.map((run) => <option value={run.id} key={run.id}>{run.label}</option>)}</select></label><label><span>Candidate</span><select value={candidate?.id ?? ""} onChange={(event) => setCandidateId(event.target.value)}>{runs.map((run) => <option value={run.id} key={run.id}>{run.label}</option>)}</select></label></div><div className="summary-deltas"><span>Runtime <strong>{signed((candidate?.durationMs ?? 0) - (baseline?.durationMs ?? 0))} ms</strong></span><span>Token count <strong>{signed((candidate?.tokens.length ?? 0) - (baseline?.tokens.length ?? 0))}</strong></span></div><table><thead><tr><th>Token</th><th>Baseline</th><th>Candidate</th><th>Δ</th></tr></thead><tbody>{tokenIds.slice(0, 14).map((tokenId) => { const left = probability(baseline, tokenId); const right = probability(candidate, tokenId); const delta = left == null || right == null ? null : right - left; return <tr key={tokenId}><td><code>{display(tokenId)}</code></td><td>{left == null ? "outside top-k" : formatPercent(left)}</td><td>{right == null ? "outside top-k" : formatPercent(right)}</td><td className={delta == null ? "" : delta < 0 ? "negative" : "positive"}>{delta == null ? "—" : `${signed(delta * 100)} pp`}</td></tr>; })}</tbody></table><p><Info />This comparison uses persisted top-k output summaries. Open an intervention run’s Logits tab for exact full-vocabulary KL and logit deltas while its live tensors are available.</p></aside></div></div>;
+}
+
+function DatasetExperiments({ series, recipes, results, result, seriesId, setSeriesId, recipeId, setRecipeId, resultId, setResultId, loading, error, onRun, onSelectRun, onShowRuns }: { series: ExperimentSeries[]; recipes: InterventionRecipe[]; results: DatasetAblationResult[]; result: DatasetAblationResult | undefined; seriesId: string; setSeriesId: (id: string) => void; recipeId: string; setRecipeId: (id: string) => void; resultId: string; setResultId: (id: string) => void; loading: boolean; error: string | null; onRun: () => void; onSelectRun: (runId: string) => void; onShowRuns: () => void }) {
+  return <div className="dataset-experiments"><header className="dataset-toolbar"><div><strong>Dataset effects</strong><span>Run one exact intervention consistently across the baselines from a prompt collection.</span></div><button onClick={onShowRuns}>Run table</button></header><section className="dataset-setup"><header><div><strong>Collection intervention</strong><span>Baseline membership is frozen when the prompt batch completes, so old and new runs are never mixed.</span></div><button className="primary" disabled={loading || !seriesId || !recipeId} onClick={onRun}>{loading ? <span className="spinner" /> : <Play />}Run across collection</button></header><div><label><span>Prompt-batch series</span><select value={seriesId} onChange={(event) => setSeriesId(event.target.value)}><option value="">Choose a completed batch</option>{series.map((entry) => <option value={entry.id} key={entry.id}>{entry.collectionName} · {entry.runIds.length} prompts · {new Date(entry.createdAt).toLocaleString()}</option>)}</select></label><label><span>Ablation recipe</span><select value={recipeId} onChange={(event) => setRecipeId(event.target.value)}><option value="">Choose a saved recipe</option>{recipes.map((recipe) => <option value={recipe.id} key={recipe.id}>{recipe.name} · {recipe.componentIds.length} component{recipe.componentIds.length === 1 ? "" : "s"}</option>)}</select></label></div>{!series.length && <p><Info />Create a prompt collection and run it once to produce a baseline series.</p>}{!recipes.length && <p><Info />Select one or more heads or MLPs, then save a zero- or mean-ablation recipe.</p>}{error && <div className="dialog-error">{error}</div>}</section>{results.length > 0 && <label className="dataset-result-picker"><span>Saved result</span><select value={resultId || result?.id || ""} onChange={(event) => setResultId(event.target.value)}>{results.map((entry) => <option value={entry.id} key={entry.id}>{entry.seriesName ?? "Prompt set"} · {entry.recipeName ?? entry.componentIds.map(shortComponentId).join(", ")} · {entry.summary.completedCount}/{entry.summary.requestedCount}</option>)}</select></label>}{result ? <DatasetAblationPanel result={result} onSelectRun={onSelectRun} /> : <EvidencePrompt message="Run an ablation recipe across a prompt collection to measure aggregate and per-prompt causal effects." />}</div>;
+}
+
+function DatasetAblationPanel({ result, onSelectRun }: { result: DatasetAblationResult; onSelectRun: (runId: string) => void }) {
+  const summary = result.summary;
+  const format = (value: number | null) => value == null ? "—" : signed(value);
+  return <section className="dataset-result"><header><div><strong>{result.recipeName ?? result.componentIds.map(shortComponentId).join(", ")}</strong><span>{result.seriesName ?? `${summary.requestedCount} selected prompts`} · {result.kind.replaceAll("_", " ")} · {visibleToken(result.metric.targetToken)}{result.metric.distractorToken ? ` − ${visibleToken(result.metric.distractorToken)}` : ""}</span></div><small>{(result.durationMs / 1000).toFixed(1)} s</small></header><div className="dataset-summary"><span><small>Mean Δ</small><strong className={(summary.meanDelta ?? 0) < 0 ? "negative" : "positive"}>{format(summary.meanDelta)}</strong></span><span><small>Median Δ</small><strong>{format(summary.medianDelta)}</strong></span><span><small>Mean |Δ|</small><strong>{summary.meanAbsoluteDelta?.toFixed(4) ?? "—"}</strong></span><span><small>Std. deviation</small><strong>{summary.standardDeviation?.toFixed(4) ?? "—"}</strong></span><span><small>Direction consistency</small><strong>{summary.directionConsistency == null ? "—" : formatPercent(summary.directionConsistency)}</strong></span><span><small>Completed</small><strong>{summary.completedCount}/{summary.requestedCount}</strong></span></div><div className="dataset-rows"><table><thead><tr><th>Prompt</th><th>Baseline</th><th>Intervened</th><th>Δ metric</th><th>Status</th></tr></thead><tbody>{result.rows.map((row) => <tr key={row.baselineRunId} className={row.status === "error" ? "failed" : ""} onClick={() => row.intervenedRunId && onSelectRun(row.intervenedRunId)}><td><strong>{row.label}</strong><small>{row.prompt}</small></td><td>{row.baselineValue?.toFixed(4) ?? "—"}</td><td>{row.intervenedValue?.toFixed(4) ?? "—"}</td><td className={(row.delta ?? 0) < 0 ? "negative" : "positive"}>{format(row.delta)}</td><td>{row.status === "complete" ? "Exact run" : row.error}</td></tr>)}</tbody></table></div><footer><Info />{result.caveat} Direction consistency is the share of completed rows with the same sign as the mean effect.</footer></section>;
+}
+
+function PythonLine({ line }: { line: string }) {
+  const pattern = /("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|#.*$|\b(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|not|or|pass|raise|return|True|try|while|with|yield)\b|\b\d+(?:\.\d+)?\b)/g;
+  return <>{line.split(pattern).filter((part) => part !== "").map((part, index) => {
+    const className = part.startsWith("#") ? "py-comment" : part.startsWith("\"") || part.startsWith("'") ? "py-string" : /^\d/.test(part) ? "py-number" : /^(?:and|as|assert|async|await|break|class|continue|def|del|elif|else|except|False|finally|for|from|global|if|import|in|is|lambda|None|not|or|pass|raise|return|True|try|while|with|yield)$/.test(part) ? "py-keyword" : undefined;
+    return className ? <span className={className} key={`${index}-${part}`}>{part}</span> : part;
+  })}</>;
+}
+
+function CodePanel({ architecture, selected, model, prompt, run, scratchpad, onScratchpadChange }: { architecture: ArchitectureGraph | null; selected: ComponentNode | null; model: ModelCatalogEntry; prompt: string; run: RunRecord | null; scratchpad: string; onScratchpadChange: (value: string) => void }) {
+  const [codeMode, setCodeMode] = useState<"generated" | "scratchpad">("generated");
   const selectedHead = selected?.kind === "head" ? selected : null;
   const intervention = run?.interventions[0];
   const component = intervention?.componentIds[0];
@@ -1407,7 +1865,162 @@ function CodePanel({ architecture, selected, model, prompt, run }: { architectur
     ...interventionLines,
     architecture ? `# ${architecture.nLayers} layers × ${architecture.nHeads} heads · ${architecture.dModel}-wide residual stream` : "# Load a model to inspect its architecture",
   ];
-  return <div className="code-panel"><header><span>Equivalent code <small>(TransformerLens)</small></span><button onClick={() => void navigator.clipboard?.writeText(lines.join("\n"))}><Code2 />Copy Python</button></header><pre>{lines.map((line, index) => <div key={`${index}-${line}`}><span>{index + 1}</span><code>{line}</code></div>)}</pre></div>;
+  const generated = lines.join("\n");
+  const activeCode = codeMode === "generated" ? generated : scratchpad;
+  const loadGenerated = () => {
+    if (scratchpad.trim() && !window.confirm("Replace the current scratchpad with the generated TransformerLens code?")) return;
+    onScratchpadChange(generated);
+    setCodeMode("scratchpad");
+  };
+  return <div className="code-panel research-code"><header><div className="code-mode"><button className={codeMode === "generated" ? "active" : ""} onClick={() => setCodeMode("generated")}>Generated</button><button className={codeMode === "scratchpad" ? "active" : ""} onClick={() => setCodeMode("scratchpad")}>Scratchpad <small>not executed</small></button></div><div className="code-actions"><button onClick={() => void navigator.clipboard?.writeText(activeCode)}><Code2 />Copy</button><button onClick={() => downloadTextFile(`${model.id}-kannaadi.py`, activeCode)} disabled={!activeCode}><Download />Export .py</button></div></header>{codeMode === "generated" ? <><pre>{lines.map((line, index) => <div key={`${index}-${line}`}><span className="line-number">{index + 1}</span><code><PythonLine line={line} /></code></div>)}</pre><footer><span>Generated from the current model, prompt, selection, and intervention.</span><button onClick={loadGenerated}>Use as scratchpad</button></footer></> : <><textarea aria-label="Python research scratchpad" spellCheck={false} value={scratchpad} onChange={(event) => onScratchpadChange(event.target.value)} placeholder="# Write bespoke TransformerLens analysis here…\n# This editor saves locally but never executes code." /><footer><span><Info />Saved with this model and workspace. Code execution is intentionally disabled in the GUI.</span>{scratchpad && <button onClick={() => onScratchpadChange("")}>Clear scratchpad</button>}</footer></>}</div>;
+}
+
+function IntegratedCodePanel({ architecture, selected, selection, model, prompt, run, scratchpad, onScratchpadChange, cells, onCellsChange, onRunsChanged }: {
+  architecture: ArchitectureGraph | null;
+  selected: ComponentNode | null;
+  selection: string[];
+  model: ModelCatalogEntry;
+  prompt: string;
+  run: RunRecord | null;
+  scratchpad: string;
+  onScratchpadChange: (value: string) => void;
+  cells: CodeCell[];
+  onCellsChange: (cells: CodeCell[]) => void;
+  onRunsChanged: (runs: RunRecord[]) => void;
+}) {
+  const [mode, setMode] = useState<"generated" | "lab">("generated");
+  const [trusted, setTrusted] = useState(false);
+  const [runningCell, setRunningCell] = useState<string | null>(null);
+  const [session, setSession] = useState<CodeSessionStatus | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const initialCellId = useRef(`cell-${crypto.randomUUID()}`);
+  const defaultCode = scratchpad || [
+    "# Kannaadi injects model, active_run, tokens, cache, selection, and kannaadi.",
+    "# The final expression is published back into this panel.",
+    run ? "active_run.top_predictions[:5]" : `kannaadi.run(${JSON.stringify(prompt)}, label="Code Lab run").top_predictions[:5]`,
+  ].join("\n");
+  const visibleCells: CodeCell[] = cells.length ? cells : [{
+    id: initialCellId.current,
+    code: defaultCode,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    execution: null,
+  }];
+
+  useEffect(() => {
+    if (mode !== "lab" || !architecture) return;
+    let cancelled = false;
+    void api.codeSession().then((status) => {
+      if (!cancelled) { setSession(status); setSessionError(null); }
+    }).catch((error) => {
+      if (!cancelled) setSessionError(error instanceof Error ? error.message : "Code Lab session unavailable");
+    });
+    return () => { cancelled = true; };
+  }, [mode, architecture]);
+
+  const persistCells = (next: CodeCell[]) => {
+    onCellsChange(next);
+    if (next[0]) onScratchpadChange(next[0].code);
+  };
+  const updateCell = (cellId: string, update: Partial<CodeCell>) => {
+    persistCells(visibleCells.map((cell) => cell.id === cellId ? { ...cell, ...update, updatedAt: new Date().toISOString() } : cell));
+  };
+  const addCell = (code = "# Use model, tokens, cache, selection, or kannaadi here\n") => {
+    const now = new Date().toISOString();
+    persistCells([...visibleCells, { id: `cell-${crypto.randomUUID()}`, code, createdAt: now, updatedAt: now, execution: null }]);
+    setMode("lab");
+  };
+  const removeCell = (cellId: string) => {
+    const next = visibleCells.filter((cell) => cell.id !== cellId);
+    persistCells(next.length ? next : []);
+  };
+  const trustWorkspace = () => {
+    if (trusted) return true;
+    const approved = window.confirm("Run this workspace's Python locally? Code Lab has access to the loaded model process and your computer. Imported code is never run automatically.");
+    if (approved) setTrusted(true);
+    return approved;
+  };
+  const runCell = async (cell: CodeCell) => {
+    if (!architecture || runningCell || !trustWorkspace()) return;
+    setRunningCell(cell.id);
+    setSessionError(null);
+    try {
+      const execution = await api.executeCode(cell.code, cell.id, true, run?.id ?? null, selection);
+      updateCell(cell.id, { execution });
+      setSession(await api.codeSession());
+      onRunsChanged(await api.runs());
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : "Python execution failed");
+    } finally {
+      setRunningCell(null);
+    }
+  };
+  const interrupt = async () => {
+    try { setSession(await api.interruptCode()); } catch (error) { setSessionError(error instanceof Error ? error.message : "Interrupt failed"); }
+  };
+  const restart = async () => {
+    try { setSession(await api.restartCodeSession()); setSessionError(null); } catch (error) { setSessionError(error instanceof Error ? error.message : "Session restart failed"); }
+  };
+  const selectedHook = selected?.activationPoints[0];
+  const insertCurrentContext = () => {
+    const code = selectedHook && run ? [
+      `# ${displayName(selected)} from the active run`,
+      `hook_name = ${JSON.stringify(selectedHook)}`,
+      "result = cache[hook_name]",
+      "kannaadi.publish(result, title=hook_name)",
+    ].join("\n") : run ? [
+      "# Active Kannaadi run context",
+      "{",
+      '    "run": active_run.label,',
+      '    "tokens": [token.display for token in active_run.tokens],',
+      '    "top_predictions": [item.model_dump(by_alias=True) for item in active_run.top_predictions[:10]],',
+      "}",
+    ].join("\n") : [
+      "# Create a real run using the already-loaded model",
+      `new_run = kannaadi.run(${JSON.stringify(prompt)}, label="Code Lab run")`,
+      "new_run.top_predictions[:10]",
+    ].join("\n");
+    addCell(code);
+  };
+
+  return <div className="integrated-code-panel">
+    <header className="integrated-code-header"><div><button className={mode === "generated" ? "active" : ""} onClick={() => setMode("generated")}>Generated recipe</button><button className={mode === "lab" ? "active" : ""} onClick={() => setMode("lab")}><Code2 />Code Lab</button></div><span className={`code-session-state ${session?.state ?? "idle"}`}><i />{architecture ? session?.state ?? "session ready" : "load a model"}</span></header>
+    {mode === "generated" ? <div className="generated-code-shell"><CodePanel architecture={architecture} selected={selected} model={model} prompt={prompt} run={run} scratchpad={scratchpad} onScratchpadChange={onScratchpadChange} /><button className="send-to-code-lab" onClick={insertCurrentContext}><Code2 />Open current context in Code Lab</button></div> :
+      <div className="code-lab">
+        <header className="code-lab-toolbar"><div><strong>Workspace Python</strong><span>{session?.namespaceKeys?.length ?? 0} live variables · model-scoped persistent namespace</span></div><div>{runningCell && <button onClick={() => void interrupt()}><X />Interrupt</button>}<button disabled={Boolean(runningCell) || !architecture} onClick={() => void restart()}><RotateCcw />Restart namespace</button><button disabled={!architecture} onClick={() => addCell()}><Plus />Cell</button></div></header>
+        {!trusted && <div className="code-trust"><Info /><div><strong>Trusted local execution</strong><span>Nothing runs automatically. The first Run asks for permission; trust is forgotten when this view is recreated.</span></div></div>}
+        {sessionError && <div className="code-session-error"><Info />{sessionError}</div>}
+        <div className="code-cell-list">{visibleCells.map((cell, index) => <section className="code-cell" key={cell.id}>
+          <header><span>In [{index + 1}]</span><div><button title="Copy cell" onClick={() => void navigator.clipboard?.writeText(cell.code)}><Code2 /></button><button title="Delete cell" disabled={visibleCells.length === 1} onClick={() => removeCell(cell.id)}><Trash2 /></button><button className="run-cell" disabled={!architecture || Boolean(runningCell)} onClick={() => void runCell(cell)}>{runningCell === cell.id ? <span className="spinner" /> : <Play />}Run</button></div></header>
+          <HighlightedPythonEditor value={cell.code} disabled={Boolean(runningCell)} onChange={(code) => updateCell(cell.id, { code })} onRun={() => void runCell(cell)} />
+          {cell.execution && <CodeCellOutput artifact={cell.execution.artifact} stdout={cell.execution.stdout} stderr={cell.execution.stderr} error={cell.execution.error} trace={cell.execution.traceback} status={cell.execution.status} duration={cell.execution.durationMs} />}
+        </section>)}</div>
+        <footer><Info /><span>Available automatically: <code>model</code>, <code>active_run</code>, <code>tokens</code>, <code>cache</code>, <code>selection</code>, <code>architecture</code>, <code>engine</code>, and <code>kannaadi</code>. Imported workspace code never auto-runs.</span></footer>
+      </div>}
+  </div>;
+}
+
+function HighlightedPythonEditor({ value, disabled, onChange, onRun }: { value: string; disabled: boolean; onChange: (value: string) => void; onRun: () => void }) {
+  const highlight = useRef<HTMLPreElement>(null);
+  const syncScroll = (target: HTMLTextAreaElement) => {
+    if (!highlight.current) return;
+    highlight.current.scrollTop = target.scrollTop;
+    highlight.current.scrollLeft = target.scrollLeft;
+  };
+  return <div className="highlighted-editor"><pre ref={highlight} aria-hidden="true">{value.split("\n").map((line, index) => <div key={`${index}-${line}`}><span>{index + 1}</span><code><PythonLine line={line || " "} /></code></div>)}</pre><textarea aria-label="Executable Python cell" disabled={disabled} spellCheck={false} value={value} onScroll={(event) => syncScroll(event.currentTarget)} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); onRun(); } }} /></div>;
+}
+
+function CodeCellOutput({ artifact, stdout, stderr, error, trace, status, duration }: { artifact: CodeArtifact; stdout: string; stderr: string; error: string | null; trace: string | null; status: "complete" | "error" | "interrupted"; duration: number }) {
+  const body = artifact.kind === "image" && typeof artifact.data === "string" ? <img src={artifact.data} alt={artifact.title} />
+    : artifact.kind === "table" && Array.isArray(artifact.data) ? <ArtifactTable rows={artifact.data as Record<string, unknown>[]} />
+      : artifact.kind === "text" ? <pre>{String(artifact.data ?? "")}</pre>
+        : artifact.kind !== "none" ? <pre>{JSON.stringify(artifact.data, null, 2)}</pre> : null;
+  return <div className={`code-cell-output ${status}`}><header><strong>{error || artifact.title}</strong><span>{status} · {duration} ms</span></header>{stdout && <section><small>stdout</small><pre>{stdout}</pre></section>}{stderr && <section><small>stderr</small><pre>{stderr}</pre></section>}{body}{Object.keys(artifact.metadata).length > 0 && <details><summary>Artifact metadata</summary><pre>{JSON.stringify(artifact.metadata, null, 2)}</pre></details>}{trace && <details open><summary>Traceback</summary><pre>{trace}</pre></details>}</div>;
+}
+
+function ArtifactTable({ rows }: { rows: Record<string, unknown>[] }) {
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(0, 30);
+  return <div className="artifact-table"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{rows.slice(0, 500).map((row, index) => <tr key={index}>{columns.map((column) => <td key={column}><code>{typeof row[column] === "object" ? JSON.stringify(row[column]) : String(row[column] ?? "")}</code></td>)}</tr>)}</tbody></table>{rows.length > 500 && <small>Showing 500 of {rows.length} rows.</small>}</div>;
 }
 
 function EvidenceEmpty({ tab, selected }: { tab: PanelTab; selected: ComponentNode | null }) {
@@ -1427,6 +2040,75 @@ function ContextMenu(props: { menu: { x: number; y: number; node: ComponentNode 
   const action = (message: string) => { onAction(message); onClose(); };
   const intervenable = menu.node.kind === "head" || menu.node.kind === "mlp";
   return <div className="context-menu" style={{ left: Math.min(menu.x, window.innerWidth - 220), top: Math.min(menu.y, window.innerHeight - 290) }} role="menu"><header><ComponentGlyph kind={menu.node.kind} /><span>{displayName(menu.node)}</span></header><button onClick={onInspect}><Eye />Inspect evidence</button><button onClick={onExpand}><Maximize2 />Expand internals</button><button disabled={!run || !intervenable} onClick={onAblate}><CircleDot />Zero ablate</button><button disabled={!canPatch || !intervenable} onClick={onPatch}><SquareDashedMousePointer />Patch clean → corrupted</button><hr /><button onClick={() => action("Use Save Group in the inspector to name and reuse this selection.")}><Save />Save selection</button></div>;
+}
+
+function PromptManagerDialog(props: {
+  prompts: PromptEntry[];
+  collections: PromptCollection[];
+  running: boolean;
+  loaded: boolean;
+  onClose: () => void;
+  onSavePrompt: (name: string, text: string) => void;
+  onDeletePrompt: (id: string) => void;
+  onSaveCollection: (name: string, promptIds: string[]) => void;
+  onDeleteCollection: (id: string) => void;
+  onRunBatch: (id: string) => Promise<RunRecord[]>;
+}) {
+  const { prompts, collections, running, loaded, onClose, onSavePrompt, onDeletePrompt, onSaveCollection, onDeleteCollection, onRunBatch } = props;
+  const [name, setName] = useState("");
+  const [text, setText] = useState("");
+  const [collectionName, setCollectionName] = useState("");
+  const [members, setMembers] = useState<string[]>([]);
+  const [error, setError] = useState<string | null>(null);
+  const addPrompt = () => {
+    if (!name.trim() || !text.trim()) return;
+    onSavePrompt(name.trim(), text.trim());
+    setName(""); setText("");
+  };
+  const saveCollection = () => {
+    if (!collectionName.trim() || !members.length) return;
+    onSaveCollection(collectionName.trim(), members);
+    setCollectionName(""); setMembers([]);
+  };
+  const runBatch = async (id: string) => {
+    setError(null);
+    try { await onRunBatch(id); }
+    catch (cause) { setError(cause instanceof Error ? cause.message : "Batch run failed"); }
+  };
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="model-dialog library-dialog" role="dialog" aria-modal="true" aria-labelledby="prompt-library-title"><header><div><h2 id="prompt-library-title">Prompt library</h2><p>Create reusable prompts and ordered collections for repeatable batch experiments.</p></div><button aria-label="Close" onClick={onClose}><X /></button></header><div className="library-grid"><section><h3>New prompt</h3><label><span>Name</span><input value={name} onChange={(event) => setName(event.target.value)} placeholder="Induction: repeated token" /></label><label><span>Prompt text</span><textarea rows={4} value={text} onChange={(event) => setText(event.target.value)} placeholder="When John and Mary went to the store, John gave..." /></label><button className="primary library-action" disabled={!name.trim() || !text.trim()} onClick={addPrompt}><Plus />Add prompt</button><div className="library-list"><h3>Saved prompts <small>{prompts.length}</small></h3>{prompts.map((entry) => <div key={entry.id}><label className="prompt-check"><input type="checkbox" checked={members.includes(entry.id)} onChange={() => setMembers((current) => current.includes(entry.id) ? current.filter((id) => id !== entry.id) : [...current, entry.id])} /><span><strong>{entry.name}</strong><small>{entry.text}</small></span></label><button aria-label={`Delete ${entry.name}`} onClick={() => onDeletePrompt(entry.id)}><Trash2 /></button></div>)}</div></section><section><h3>New collection</h3><label><span>Collection name</span><input value={collectionName} onChange={(event) => setCollectionName(event.target.value)} placeholder="Geography benchmark" /></label><p className="selection-hint">Select prompts on the left. Collections preserve membership and can be rerun after changing the model.</p><button className="primary library-action" disabled={!collectionName.trim() || !members.length} onClick={saveCollection}><ListPlus />Save collection ({members.length})</button><div className="collection-list"><h3>Collections <small>{collections.length}</small></h3>{collections.map((entry) => <div key={entry.id}><Library /><span><strong>{entry.name}</strong><small>{entry.promptIds.length} prompts</small></span><button disabled={running || !loaded || !entry.promptIds.length} onClick={() => void runBatch(entry.id)}><Play />Run batch</button><button aria-label={`Delete ${entry.name}`} onClick={() => onDeleteCollection(entry.id)}><Trash2 /></button></div>)}</div></section></div>{error && <div className="dialog-error">{error}</div>}<footer><span>Prompt libraries are saved locally and included in workspace snapshots.</span><button className="primary" onClick={onClose}>Done</button></footer></section></div>;
+}
+
+function RunDialog(props: {
+  prompts: PromptEntry[];
+  collections: PromptCollection[];
+  currentPrompt: string;
+  running: boolean;
+  loaded: boolean;
+  onClose: () => void;
+  onRun: (promptId: string, label: string) => Promise<void>;
+  onRunBatch: (id: string) => Promise<RunRecord[]>;
+}) {
+  const { prompts, collections, currentPrompt, running, loaded, onClose, onRun, onRunBatch } = props;
+  const [mode, setMode] = useState<"prompt" | "batch">("prompt");
+  const [promptId, setPromptId] = useState(prompts[0]?.id ?? "");
+  const [collectionId, setCollectionId] = useState(collections[0]?.id ?? "");
+  const [label, setLabel] = useState("");
+  const [error, setError] = useState<string | null>(null);
+  const submit = async () => {
+    setError(null);
+    try {
+      if (mode === "batch") { await onRunBatch(collectionId); onClose(); }
+      else await onRun(promptId, label.trim());
+    } catch (cause) { setError(cause instanceof Error ? cause.message : "Run failed"); }
+  };
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="model-dialog run-dialog" role="dialog" aria-modal="true" aria-labelledby="run-dialog-title"><header><div><h2 id="run-dialog-title">Start experiment run</h2><p>Run one reusable prompt or execute a whole collection against the loaded model.</p></div><button aria-label="Close" onClick={onClose}><X /></button></header><div className="mode-switch"><button className={mode === "prompt" ? "active" : ""} onClick={() => setMode("prompt")}><FileJson />Single prompt</button><button className={mode === "batch" ? "active" : ""} onClick={() => setMode("batch")}><Library />Prompt batch</button></div>{mode === "prompt" ? <><label><span>Saved prompt</span><select value={promptId} onChange={(event) => setPromptId(event.target.value)}>{prompts.map((entry) => <option value={entry.id} key={entry.id}>{entry.name}</option>)}</select></label><label><span>Run label <small>optional</small></span><input value={label} onChange={(event) => setLabel(event.target.value)} placeholder="Baseline / seed A" /></label><div className="run-preview"><small>Prompt preview</small><p>{prompts.find((entry) => entry.id === promptId)?.text ?? currentPrompt}</p></div></> : <><label><span>Prompt collection</span><select value={collectionId} onChange={(event) => setCollectionId(event.target.value)}>{collections.map((entry) => <option value={entry.id} key={entry.id}>{entry.name} ({entry.promptIds.length})</option>)}</select></label><div className="run-preview"><small>Batch behavior</small><p>Runs each prompt sequentially, preserving labels and output summaries as one experimental series.</p></div></>}{error && <div className="dialog-error">{error}</div>}<footer><button onClick={onClose}>Cancel</button><button className="primary" disabled={running || !loaded || (mode === "prompt" ? !promptId : !collectionId)} onClick={() => void submit()}>{running ? <span className="spinner" /> : <Play />}{mode === "batch" ? "Run batch" : "Run prompt"}</button></footer></section></div>;
+}
+
+function InterventionRecipeDialog({ selected, defaultPositions, onClose, onSave }: { selected: ComponentNode[]; defaultPositions: number[]; onClose: () => void; onSave: (name: string, kind: InterventionRecipe["kind"]) => void }) {
+  const [name, setName] = useState("");
+  const [kind, setKind] = useState<InterventionRecipe["kind"]>("zero_ablation");
+  const components = selected.filter((node) => node.kind === "head" || node.kind === "mlp");
+  return <div className="modal-backdrop" onMouseDown={(event) => event.target === event.currentTarget && onClose()}><section className="model-dialog recipe-dialog" role="dialog" aria-modal="true" aria-labelledby="recipe-dialog-title"><header><div><h2 id="recipe-dialog-title">Save intervention recipe</h2><p>Turn the current selection and token scope into a reusable causal experiment.</p></div><button aria-label="Close" onClick={onClose}><X /></button></header><label><span>Recipe name</span><input autoFocus value={name} onChange={(event) => setName(event.target.value)} placeholder="Ablate induction heads" /></label><label><span>Intervention</span><select value={kind} onChange={(event) => setKind(event.target.value as InterventionRecipe["kind"])}><option value="zero_ablation">Zero ablation</option><option value="mean_ablation">Within-prompt mean ablation</option><option value="activation_patch">Clean-to-corrupted activation patch</option></select></label><div className="recipe-summary"><strong>{components.length} selected component{components.length === 1 ? "" : "s"}</strong><span>{components.slice(0, 8).map(displayName).join(", ") || "Select attention heads or MLPs first"}</span><small>{defaultPositions.length ? `Token positions: ${defaultPositions.join(", ")}` : "Token scope: all positions"}</small></div><footer><button onClick={onClose}>Cancel</button><button className="primary" disabled={!name.trim() || !components.length} onClick={() => onSave(name.trim(), kind)}><Save />Save recipe</button></footer></section></div>;
 }
 
 function ExperimentDialog(props: {
@@ -1542,7 +2224,16 @@ function usePersistentJson<T>(key: string, fallback: T): [T, (value: T | ((curre
 }
 function isTextInput(target: EventTarget | null): boolean { return target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement; }
 function clamp(value: number, minimum: number, maximum: number): number { return Math.min(maximum, Math.max(minimum, value)); }
-function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; model: ModelCatalogEntry; run: RunRecord | null; contrast: ContrastResult | null; effects: Record<string, CausalEffect>; headSweep: HeadSweepResult | null; mlpSweep: MlpSweepResult | null; attribution: AttributionResult | null; selection: string[]; groups: ComponentGroup[] }) {
+function downloadTextFile(name: string, contents: string): void {
+  const blob = new Blob([contents], { type: "text/x-python;charset=utf-8" });
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = name;
+  anchor.click();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; model: ModelCatalogEntry; run: RunRecord | null; contrast: ContrastResult | null; effects: Record<string, CausalEffect>; headSweep: HeadSweepResult | null; mlpSweep: MlpSweepResult | null; attribution: AttributionResult | null; datasetAblations: DatasetAblationResult[]; scratchpad: string; codeCells: CodeCell[]; selection: string[]; groups: ComponentGroup[] }) {
   const bundle = {
     format: "kannaadi-research-bundle",
     version: 1,
@@ -1558,6 +2249,9 @@ function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; 
     headSweep: data.headSweep,
     mlpSweep: data.mlpSweep,
     directAttribution: data.attribution,
+    datasetAblations: data.datasetAblations,
+    codeScratchpad: data.scratchpad,
+    codeCells: data.codeCells,
     selection: data.selection,
     groups: data.groups,
   };

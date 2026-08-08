@@ -1,14 +1,19 @@
 import pytest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from kannaadi.adapters import TransformerLensAdapter
 from kannaadi.api.app import RuntimeState, app
+from kannaadi.code_execution import CodeSession
 from kannaadi.domain import (
     AlignmentPair,
     AttributionEffect,
     AttributionResult,
     ContrastResult,
+    DatasetAblationResult,
+    DatasetAblationRow,
+    DatasetAblationSummary,
     InterventionResult,
     MetricResult,
     ModelSpec,
@@ -142,6 +147,44 @@ class ExperimentStub:
             minimum=.5,
             maximum=2.0,
             durationMs=12,
+        )
+
+    def dataset_ablation(self, run_ids, component_ids, **kwargs):
+        assert run_ids == ["run_test"]
+        assert component_ids == ["blocks.1.attn.head.2"]
+        assert kwargs["kind"] == "zero_ablation"
+        assert kwargs["metric"].target_token == " Paris"
+        return DatasetAblationResult(
+            id="dataset_test",
+            kind="zero_ablation",
+            componentIds=component_ids,
+            tokenScope="all",
+            positions=[],
+            metric=kwargs["metric"],
+            rows=[DatasetAblationRow(
+                baselineRunId="run_test",
+                intervenedRunId="run_ablation",
+                intervenedRun=run_record("intervened", "run_test"),
+                label="Clean run",
+                prompt="The capital of France is",
+                status="complete",
+                baselineValue=2.5,
+                intervenedValue=1.75,
+                delta=-.75,
+            )],
+            summary=DatasetAblationSummary(
+                requestedCount=1,
+                completedCount=1,
+                failedCount=0,
+                meanDelta=-.75,
+                medianDelta=-.75,
+                standardDeviation=0,
+                minimumDelta=-.75,
+                maximumDelta=-.75,
+                meanAbsoluteDelta=.75,
+                directionConsistency=1,
+            ),
+            durationMs=20,
         )
 
 
@@ -311,3 +354,51 @@ def test_mlp_sweep_and_direct_attribution_are_first_class_api_workflows() -> Non
     assert attribution.status_code == 200
     assert attribution.json()["method"] == "direct_logit_attribution_fixed_final_norm"
     assert attribution.json()["componentSum"] + attribution.json()["remainder"] == pytest.approx(2.5)
+
+
+def test_dataset_ablation_returns_per_prompt_evidence_and_aggregate_statistics() -> None:
+    app.state.runtime.adapter = LoadedAdapter()
+    app.state.runtime.experiments = ExperimentStub()
+
+    response = client.post(
+        "/api/v1/experiments/dataset-ablation",
+        json={
+            "runIds": ["run_test"],
+            "kind": "zero_ablation",
+            "componentIds": ["blocks.1.attn.head.2"],
+            "tokenScope": "all",
+            "positions": [],
+            "metric": {"targetToken": " Paris", "distractorToken": " Berlin", "position": -1},
+        },
+    )
+    assert response.status_code == 200
+    assert response.json()["rows"][0]["intervenedRunId"] == "run_ablation"
+    assert response.json()["rows"][0]["intervenedRun"]["kind"] == "intervened"
+    assert response.json()["rows"][0]["delta"] == -.75
+    assert response.json()["summary"]["directionConsistency"] == 1
+    assert "selected prompt set" in response.json()["caveat"]
+
+
+def test_code_lab_endpoint_requires_trust_and_returns_structured_output() -> None:
+    engine = ExperimentStub()
+    adapter = SimpleNamespace(model=SimpleNamespace(name="fake-model"))
+    app.state.runtime.adapter = adapter
+    app.state.runtime.experiments = engine
+    app.state.runtime.code_session = CodeSession(engine, adapter, graph(), "gpt2-small")
+
+    denied = client.post("/api/v1/code/execute", json={"code": "1 + 1", "trusted": False})
+    assert denied.status_code == 403
+
+    response = client.post("/api/v1/code/execute", json={
+        "code": "print('ready')\nkannaadi.table([{'component': selection[0], 'effect': 1.5}], title='Effects')",
+        "cellId": "cell-1",
+        "trusted": True,
+        "selection": ["blocks.1.mlp"],
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "complete"
+    assert payload["stdout"] == "ready\n"
+    assert payload["artifact"]["kind"] == "table"
+    assert payload["artifact"]["data"][0]["component"] == "blocks.1.mlp"
+    assert client.get("/api/v1/code/session").json()["state"] == "idle"

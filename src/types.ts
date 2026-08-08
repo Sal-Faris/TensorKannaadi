@@ -35,6 +35,46 @@ export type LayerNode = {
   residualPost: ComponentNode;
 };
 
+export type FlowPort = {
+  id: string;
+  label: string;
+  direction: "input" | "output";
+  tensorRole: string;
+  shape: (string | number)[];
+};
+
+export type FlowModule = {
+  id: string;
+  label: string;
+  role: string;
+  kind: ComponentKind | "model" | "stage" | "tokenizer" | "logits";
+  parentId: string | null;
+  componentId: string | null;
+  layer?: number;
+  ports: FlowPort[];
+  childIds: string[];
+  metadata: Record<string, unknown>;
+};
+
+export type FlowEdge = {
+  id: string;
+  sourceModuleId: string;
+  sourcePortId: string;
+  targetModuleId: string;
+  targetPortId: string;
+  kind: "data" | "residual" | "add" | "readout";
+  tensorRole: string;
+  label: string | null;
+};
+
+export type CanonicalFlowGraph = {
+  schemaVersion: number;
+  rootModuleId: string;
+  modules: FlowModule[];
+  edges: FlowEdge[];
+  capabilities: string[];
+};
+
 export type ArchitectureGraph = {
   modelId: string;
   displayName: string;
@@ -55,6 +95,46 @@ export type ArchitectureGraph = {
   layers: LayerNode[];
   finalNorm: ComponentNode;
   unembedding: ComponentNode;
+  flow: CanonicalFlowGraph;
+};
+
+export type CodeArtifact = {
+  kind: "none" | "text" | "json" | "table" | "tensor" | "image";
+  title: string;
+  data: unknown;
+  metadata: Record<string, unknown>;
+};
+
+export type CodeExecutionResult = {
+  id: string;
+  cellId: string | null;
+  status: "complete" | "error" | "interrupted";
+  stdout: string;
+  stderr: string;
+  artifact: CodeArtifact;
+  error: string | null;
+  traceback: string | null;
+  durationMs: number;
+  startedAt: string;
+  finishedAt: string;
+  namespaceKeys: string[];
+  provenance: Record<string, unknown>;
+};
+
+export type CodeSessionStatus = {
+  state: "idle" | "running" | "interrupting";
+  executionId: string | null;
+  startedAt: string | null;
+  namespaceKeys: string[];
+  trustModel: string;
+};
+
+export type CodeCell = {
+  id: string;
+  code: string;
+  createdAt: string;
+  updatedAt: string;
+  execution: CodeExecutionResult | null;
 };
 
 export type RuntimeStatus = {
@@ -172,6 +252,8 @@ export type ResidualPoint = {
   stage: "pre" | "mid" | "post";
   norm: number;
   targetLogit: number;
+  entropy: number;
+  topPredictions: Prediction[];
 };
 
 export type ResidualStreamResult = {
@@ -257,6 +339,47 @@ export type InterventionResult = {
   effect: CausalEffect | null;
 };
 
+export type DatasetAblationRow = {
+  baselineRunId: string;
+  intervenedRunId: string | null;
+  intervenedRun: RunRecord | null;
+  label: string;
+  prompt: string;
+  status: "complete" | "error";
+  baselineValue: number | null;
+  intervenedValue: number | null;
+  delta: number | null;
+  error: string | null;
+};
+
+export type DatasetAblationResult = {
+  id: string;
+  seriesId?: string;
+  seriesName?: string;
+  recipeId?: string;
+  recipeName?: string;
+  kind: "zero_ablation" | "mean_ablation";
+  componentIds: string[];
+  tokenScope: "all" | "positions";
+  positions: number[];
+  metric: MetricSpec;
+  rows: DatasetAblationRow[];
+  summary: {
+    requestedCount: number;
+    completedCount: number;
+    failedCount: number;
+    meanDelta: number | null;
+    medianDelta: number | null;
+    standardDeviation: number | null;
+    minimumDelta: number | null;
+    maximumDelta: number | null;
+    meanAbsoluteDelta: number | null;
+    directionConsistency: number | null;
+  };
+  durationMs: number;
+  caveat: string;
+};
+
 export type HeadEffect = {
   componentId: string;
   layer: number;
@@ -321,9 +444,54 @@ export type ComponentGroup = {
   componentIds: string[];
 };
 
+export type PromptEntry = {
+  id: string;
+  name: string;
+  text: string;
+  createdAt: string;
+};
+
+export type PromptCollection = {
+  id: string;
+  name: string;
+  promptIds: string[];
+  createdAt: string;
+};
+
+export type ExperimentSeries = {
+  id: string;
+  collectionId: string;
+  collectionName: string;
+  runIds: string[];
+  createdAt: string;
+};
+
+export type InterventionRecipe = {
+  id: string;
+  name: string;
+  kind: "zero_ablation" | "mean_ablation" | "activation_patch";
+  componentIds: string[];
+  tokenScope: "all" | "positions";
+  positions: number[];
+  targetToken: string;
+  distractorToken: string;
+  createdAt: string;
+};
+
+export type WorkspaceResults = {
+  runs: RunRecord[];
+  contrast: ContrastResult | null;
+  effects: Record<string, CausalEffect>;
+  headSweep: HeadSweepResult | null;
+  mlpSweep: MlpSweepResult | null;
+  attribution: AttributionResult | null;
+  residual: ResidualStreamResult | null;
+  datasetAblations?: DatasetAblationResult[];
+};
+
 export type WorkspaceSnapshot = {
   format: "kannaadi-workspace";
-  version: 1;
+  version: 1 | 2 | 3 | 4;
   name: string;
   savedAt: string;
   modelId: string;
@@ -336,4 +504,14 @@ export type WorkspaceSnapshot = {
   expandedLayers: number[];
   expandedHeads: string[];
   layout: { leftWidth: number; rightWidth: number; bottomHeight: number };
+  theme?: "light" | "dark";
+  registeredModels?: ModelCatalogEntry[];
+  prompts?: PromptEntry[];
+  collections?: PromptCollection[];
+  experimentSeries?: ExperimentSeries[];
+  recipes?: InterventionRecipe[];
+  scratchpads?: Record<string, string>;
+  codeCells?: Record<string, CodeCell[]>;
+  results?: WorkspaceResults;
+  viewport?: { zoom: number; pan: { x: number; y: number } };
 };

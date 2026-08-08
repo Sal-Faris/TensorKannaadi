@@ -27,11 +27,20 @@ function architecture(): ArchitectureGraph {
     vocabularySize: 50257, normType: "LN", normalizationPosition: "pre", blockTopology: "serial",
     positionalMechanism: "standard", embedding: node("embed", "Embedding", "embedding"), positionalEmbedding: node("pos_embed", "Positional embedding", "embedding"), layers,
     finalNorm: node("ln_final", "Final norm", "normalization"), unembedding: node("unembed", "Unembedding", "unembedding"),
+    flow: { schemaVersion: 1, rootModuleId: "model", modules: [
+      { id: "model", label: "Transformer", role: "model", kind: "model", parentId: null, componentId: null, ports: [], childIds: ["stage.input", "stage.block.0", "stage.output"], metadata: {} },
+      { id: "stage.input", label: "Input / initialization", role: "input_stage", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["input.embed"], metadata: {} },
+      { id: "input.embed", label: "Token embedding", role: "token_embedding", kind: "embedding", parentId: "stage.input", componentId: "embed", ports: [], childIds: [], metadata: {} },
+      { id: "stage.block.0", label: "Layer 0", role: "transformer_block", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["block.0.attn", "block.0.mlp"], metadata: { topology: "serial" } },
+      { id: "block.0.attn", label: "Attention", role: "attention", kind: "attention", parentId: "stage.block.0", componentId: "blocks.0.attn", ports: [], childIds: [], metadata: {} },
+      { id: "block.0.mlp", label: "MLP", role: "mlp", kind: "mlp", parentId: "stage.block.0", componentId: "blocks.0.mlp", ports: [], childIds: [], metadata: {} },
+      { id: "stage.output", label: "Output / readout", role: "output_stage", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["output.unembed"], metadata: {} },
+      { id: "output.unembed", label: "Unembedding", role: "unembedding", kind: "unembedding", parentId: "stage.output", componentId: "unembed", ports: [], childIds: [], metadata: {} },
+    ], edges: [], capabilities: ["block_topology:serial", "explicit_tensor_ports"] },
   };
 }
 
-function mockConnectedBackend() {
-  const graph = architecture();
+function mockConnectedBackend(graph = architecture()) {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input);
     let body: unknown = { status: "ok" };
@@ -39,9 +48,26 @@ function mockConnectedBackend() {
     if (url.endsWith("/api/v1/status")) body = { backend: "ready", torchAvailable: true, transformerLensAvailable: true, cudaAvailable: false, device: "cpu", loadedModelId: "gpt2-small", loadedModelName: "GPT-2 Small", loadState: "loaded", loadError: null, runCount: 0, cacheBytes: 0 };
     if (url.endsWith("/architecture")) body = graph;
     if (url.endsWith("/api/v1/runs")) body = [];
+    if (url.endsWith("/api/v1/code/session")) body = { state: "idle", executionId: null, startedAt: null, namespaceKeys: ["model", "kannaadi"], trustModel: "Trusted local Python" };
+    if (url.endsWith("/api/v1/code/execute")) body = { id: "exec-1", cellId: "cell-1", status: "complete", stdout: "ready\n", stderr: "", artifact: { kind: "table", title: "Head effects", data: [{ head: "L0H0", effect: 1.25 }], metadata: {} }, error: null, traceback: null, durationMs: 8, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), namespaceKeys: ["model", "kannaadi", "result"], provenance: { runtime: "trusted-local-python" } };
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   });
 }
+
+test("keeps parallel models in the established compact attention and MLP visual language", async () => {
+  const graph = architecture();
+  graph.blockTopology = "parallel";
+  mockConnectedBackend(graph);
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Select L5H3" });
+  const row = document.querySelector(".parallel-layer-row");
+  expect(row?.querySelector(".attention-stage .attention-block")).toBeInTheDocument();
+  expect(row?.querySelector(".mlp-stage .mlp-block")).toBeInTheDocument();
+  expect(document.querySelector(".parallel-attention-branch")).not.toBeInTheDocument();
+  expect(document.querySelector(".parallel-mlp-branch")).not.toBeInTheDocument();
+  expect(screen.queryByText("Canonical architecture graph")).not.toBeInTheDocument();
+});
 
 function runRecord(kind: RunRecord["kind"] = "clean"): RunRecord {
   const intervened = kind === "intervened" || kind === "patched";
@@ -82,6 +108,13 @@ function mockResearchBackend() {
     if (url.endsWith("/zero-ablate")) body = runRecord("intervened");
     if (url.endsWith("/ablate")) body = { run: runRecord("intervened"), effect: null };
     if (url.includes("/compare/")) body = { baselineRunId: "run_clean", intervenedRunId: "run_ablation", baselineTopToken: " Paris", baselineTopTokenDelta: -1.1, klDivergence: .02, tokens: [{ tokenId: 6342, text: " Paris", display: "·Paris", baselineLogit: 8.2, intervenedLogit: 7.1, deltaLogit: -1.1, baselineProbability: .38, intervenedProbability: .24, deltaProbability: -.14 }] };
+    if (url.includes("/residual-stream")) body = {
+      runId: "run_clean", position: 0, targetTokenId: 6342, targetToken: " Paris",
+      points: Array.from({ length: 6 }, (_, layer) => ["pre", "mid", "post"].map((stage, stageIndex) => ({
+        layer, stage, norm: 10 + layer, targetLogit: layer + stageIndex / 3, entropy: 5 - layer / 10,
+        topPredictions: [{ tokenId: 6342, text: " Paris", display: "·Paris", logit: layer, probability: .38 }],
+      }))).flat(),
+    };
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   });
 }
@@ -210,6 +243,119 @@ test("saves a durable browser workspace snapshot", async () => {
   await user.type(screen.getByRole("textbox", { name: "Name" }), "Geography facts");
   await user.click(screen.getByRole("button", { name: "Save workspace" }));
 
-  expect(await screen.findByRole("button", { name: "Geography facts" })).toBeInTheDocument();
+  const workspace = await screen.findByRole("button", { name: "Geography facts" });
+  expect(workspace).toBeInTheDocument();
   expect(localStorage.getItem("kannaadi.workspaces")).toContain("Geography facts");
+  await user.click(workspace);
+  expect(await screen.findByText(/Workspace “Geography facts” restored/)).toBeInTheDocument();
+});
+
+test("zooms the architecture canvas on a trackpad pinch wheel gesture", async () => {
+  mockConnectedBackend();
+  const { container } = render(<App />);
+  await screen.findByRole("button", { name: "Select L5H3" });
+  const viewport = container.querySelector(".canvas-viewport")!;
+  fireEvent.wheel(viewport, { ctrlKey: true, deltaY: -20, deltaMode: 0, clientX: 400, clientY: 240 });
+  await waitFor(() => expect(Number((screen.getByRole("slider", { name: "Zoom" }) as HTMLInputElement).value)).toBeGreaterThan(100));
+});
+
+test("manages prompt libraries and persistent dark mode", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Manage prompts and collections" }));
+  expect(screen.getByRole("heading", { name: "Prompt library" })).toBeInTheDocument();
+  await user.type(screen.getByRole("textbox", { name: "Name" }), "Induction example");
+  await user.type(screen.getByRole("textbox", { name: "Prompt text" }), "A B A B A");
+  await user.click(screen.getByRole("button", { name: "Add prompt" }));
+  expect(screen.getAllByText("Induction example").length).toBeGreaterThan(0);
+  await user.click(screen.getByRole("button", { name: "Done" }));
+
+  await user.click(screen.getByRole("button", { name: "Switch to dark mode" }));
+  expect(document.documentElement.dataset.theme).toBe("dark");
+  expect(localStorage.getItem("kannaadi.theme")).toBe("dark");
+});
+
+test("compares experiment runs and exposes highlighted reproducible code", async () => {
+  mockResearchBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Contrast" }));
+  await user.click(screen.getByRole("button", { name: "Run contrast" }));
+  await user.click(await screen.findByRole("button", { name: "Experiments" }));
+  expect(screen.getByText("Experiment runs")).toBeInTheDocument();
+  expect(screen.getByText("Compare saved output summaries")).toBeInTheDocument();
+
+  await user.click(screen.getByRole("button", { name: "Code" }));
+  expect(document.querySelector(".py-keyword")).toHaveTextContent("from");
+});
+
+test("opens a position-aware residual vocabulary readout from the canvas", async () => {
+  mockResearchBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Run" }));
+  await user.click(screen.getByTitle("blocks.5.resid_pre"));
+  expect(await screen.findByText("Residual vocabulary readout")).toBeInTheDocument();
+  expect(screen.getByRole("combobox", { name: "Residual readout position" })).toBeInTheDocument();
+  expect(screen.getByText("Top decoded tokens")).toBeInTheDocument();
+});
+
+test("restores auditable dataset effects for a frozen prompt-batch series", async () => {
+  const baseline = runRecord("clean");
+  const intervened = runRecord("intervened");
+  localStorage.setItem("kannaadi.experimentSeries", JSON.stringify([{ id: "series_geo", collectionId: "collection_geo", collectionName: "Geography facts", runIds: [baseline.id], createdAt: new Date().toISOString() }]));
+  localStorage.setItem("kannaadi.interventionRecipes", JSON.stringify([{ id: "recipe_head", name: "Ablate recall head", kind: "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all", positions: [], targetToken: " Paris", distractorToken: " Berlin", createdAt: new Date().toISOString() }]));
+  localStorage.setItem("kannaadi.datasetAblations", JSON.stringify([{
+    id: "dataset_geo", seriesId: "series_geo", seriesName: "Geography facts", recipeId: "recipe_head", recipeName: "Ablate recall head", kind: "zero_ablation", componentIds: ["blocks.5.attn.head.3"], tokenScope: "all", positions: [], metric: { targetToken: " Paris", distractorToken: " Berlin", position: -1 },
+    rows: [{ baselineRunId: baseline.id, intervenedRunId: intervened.id, intervenedRun: intervened, label: "France", prompt: baseline.prompt, status: "complete", baselineValue: 2.5, intervenedValue: 1.75, delta: -.75, error: null }],
+    summary: { requestedCount: 1, completedCount: 1, failedCount: 0, meanDelta: -.75, medianDelta: -.75, standardDeviation: 0, minimumDelta: -.75, maximumDelta: -.75, meanAbsoluteDelta: .75, directionConsistency: 1 }, durationMs: 20, caveat: "Each row is an exact intervention on one cached prompt run. The aggregate describes this selected prompt set and is not a population-level causal estimate.",
+  }]));
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Experiments" }));
+  expect(screen.getByText("Dataset effects")).toBeInTheDocument();
+  expect(screen.getAllByText("Ablate recall head").length).toBeGreaterThan(0);
+  expect(screen.getByText("Direction consistency")).toBeInTheDocument();
+  expect(screen.getByText("100.0%")).toBeInTheDocument();
+});
+
+test("keeps generated code separate from a persistent non-executing scratchpad", async () => {
+  mockConnectedBackend();
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Code" }));
+  expect(document.querySelector(".py-keyword")).toHaveTextContent("from");
+  await user.click(screen.getByRole("button", { name: /Scratchpad/ }));
+  const editor = screen.getByRole("textbox", { name: "Python research scratchpad" });
+  await user.type(editor, "# custom research\nprint('ready')");
+
+  expect(editor).toHaveValue("# custom research\nprint('ready')");
+  expect(localStorage.getItem("kannaadi.codeScratchpads")).toContain("custom research");
+  expect(screen.getByText(/Code execution is intentionally disabled/)).toBeInTheDocument();
+});
+
+test("runs trusted local Python in the integrated Code Lab and renders a structured artifact", async () => {
+  mockConnectedBackend();
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Code" }));
+  await user.click(screen.getByRole("button", { name: "Code Lab" }));
+  expect(await screen.findByText(/live variables/)).toBeInTheDocument();
+  const editor = screen.getByRole("textbox", { name: "Executable Python cell" });
+  expect((editor as HTMLTextAreaElement).value).toContain("kannaadi");
+  await user.click(editor.closest(".code-cell")!.querySelector(".run-cell") as HTMLButtonElement);
+
+  expect(await screen.findByText("Head effects")).toBeInTheDocument();
+  expect(screen.getByText("L0H0")).toBeInTheDocument();
+  expect(screen.getByText("1.25")).toBeInTheDocument();
+  expect(localStorage.getItem("kannaadi.codeCells")).toContain("exec-1");
 });

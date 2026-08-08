@@ -3,7 +3,10 @@ import type {
   ArchitectureGraph,
   AttentionResult,
   AttributionResult,
+  CodeExecutionResult,
+  CodeSessionStatus,
   ContrastResult,
+  DatasetAblationResult,
   HeadSweepResult,
   InterventionResult,
   MetricResult,
@@ -95,10 +98,10 @@ export class KannaadiApi {
     return this.request("/api/v1/runs");
   }
 
-  run(prompt: string, topK = 10, kind: "clean" | "corrupted" = "clean"): Promise<RunRecord> {
+  run(prompt: string, topK = 10, kind: "clean" | "corrupted" = "clean", label?: string): Promise<RunRecord> {
     return this.request("/api/v1/runs", {
       method: "POST",
-      body: JSON.stringify({ prompt, kind, topK, seed: 0 }),
+      body: JSON.stringify({ prompt, kind, topK, seed: 0, label }),
     });
   }
 
@@ -205,12 +208,53 @@ export class KannaadiApi {
     return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/activation?${query}`);
   }
 
-  residualStream(runId: string): Promise<ResidualStreamResult> {
-    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/residual-stream`);
+  residualStream(runId: string, position = -1, targetTokenId?: number): Promise<ResidualStreamResult> {
+    const query = new URLSearchParams({ position: String(position) });
+    if (targetTokenId !== undefined) query.set("target_token_id", String(targetTokenId));
+    return this.request(`/api/v1/runs/${encodeURIComponent(runId)}/residual-stream?${query}`);
+  }
+
+  datasetAblation(
+    runIds: string[],
+    componentIds: string[],
+    kind: "zero_ablation" | "mean_ablation",
+    positions: number[] | null,
+    metric: MetricSpec,
+  ): Promise<DatasetAblationResult> {
+    return this.request("/api/v1/experiments/dataset-ablation", {
+      method: "POST",
+      body: JSON.stringify({
+        runIds,
+        componentIds,
+        kind,
+        tokenScope: positions ? "positions" : "all",
+        positions: positions ?? [],
+        metric,
+      }),
+    });
   }
 
   compare(baselineRunId: string, intervenedRunId: string): Promise<RunComparison> {
     return this.request(`/api/v1/runs/${encodeURIComponent(baselineRunId)}/compare/${encodeURIComponent(intervenedRunId)}`);
+  }
+
+  codeSession(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/session");
+  }
+
+  executeCode(code: string, cellId: string, trusted: boolean, activeRunId: string | null, selection: string[]): Promise<CodeExecutionResult> {
+    return this.request("/api/v1/code/execute", {
+      method: "POST",
+      body: JSON.stringify({ code, cellId, trusted, activeRunId, selection }),
+    });
+  }
+
+  interruptCode(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/interrupt", { method: "POST" });
+  }
+
+  restartCodeSession(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/restart", { method: "POST" });
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {
