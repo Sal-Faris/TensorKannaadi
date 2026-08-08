@@ -27,11 +27,20 @@ function architecture(): ArchitectureGraph {
     vocabularySize: 50257, normType: "LN", normalizationPosition: "pre", blockTopology: "serial",
     positionalMechanism: "standard", embedding: node("embed", "Embedding", "embedding"), positionalEmbedding: node("pos_embed", "Positional embedding", "embedding"), layers,
     finalNorm: node("ln_final", "Final norm", "normalization"), unembedding: node("unembed", "Unembedding", "unembedding"),
+    flow: { schemaVersion: 1, rootModuleId: "model", modules: [
+      { id: "model", label: "Transformer", role: "model", kind: "model", parentId: null, componentId: null, ports: [], childIds: ["stage.input", "stage.block.0", "stage.output"], metadata: {} },
+      { id: "stage.input", label: "Input / initialization", role: "input_stage", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["input.embed"], metadata: {} },
+      { id: "input.embed", label: "Token embedding", role: "token_embedding", kind: "embedding", parentId: "stage.input", componentId: "embed", ports: [], childIds: [], metadata: {} },
+      { id: "stage.block.0", label: "Layer 0", role: "transformer_block", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["block.0.attn", "block.0.mlp"], metadata: { topology: "serial" } },
+      { id: "block.0.attn", label: "Attention", role: "attention", kind: "attention", parentId: "stage.block.0", componentId: "blocks.0.attn", ports: [], childIds: [], metadata: {} },
+      { id: "block.0.mlp", label: "MLP", role: "mlp", kind: "mlp", parentId: "stage.block.0", componentId: "blocks.0.mlp", ports: [], childIds: [], metadata: {} },
+      { id: "stage.output", label: "Output / readout", role: "output_stage", kind: "stage", parentId: "model", componentId: null, ports: [], childIds: ["output.unembed"], metadata: {} },
+      { id: "output.unembed", label: "Unembedding", role: "unembedding", kind: "unembedding", parentId: "stage.output", componentId: "unembed", ports: [], childIds: [], metadata: {} },
+    ], edges: [], capabilities: ["block_topology:serial", "explicit_tensor_ports"] },
   };
 }
 
-function mockConnectedBackend() {
-  const graph = architecture();
+function mockConnectedBackend(graph = architecture()) {
   vi.spyOn(globalThis, "fetch").mockImplementation(async (input) => {
     const url = String(input);
     let body: unknown = { status: "ok" };
@@ -39,9 +48,26 @@ function mockConnectedBackend() {
     if (url.endsWith("/api/v1/status")) body = { backend: "ready", torchAvailable: true, transformerLensAvailable: true, cudaAvailable: false, device: "cpu", loadedModelId: "gpt2-small", loadedModelName: "GPT-2 Small", loadState: "loaded", loadError: null, runCount: 0, cacheBytes: 0 };
     if (url.endsWith("/architecture")) body = graph;
     if (url.endsWith("/api/v1/runs")) body = [];
+    if (url.endsWith("/api/v1/code/session")) body = { state: "idle", executionId: null, startedAt: null, namespaceKeys: ["model", "kannaadi"], trustModel: "Trusted local Python" };
+    if (url.endsWith("/api/v1/code/execute")) body = { id: "exec-1", cellId: "cell-1", status: "complete", stdout: "ready\n", stderr: "", artifact: { kind: "table", title: "Head effects", data: [{ head: "L0H0", effect: 1.25 }], metadata: {} }, error: null, traceback: null, durationMs: 8, startedAt: new Date().toISOString(), finishedAt: new Date().toISOString(), namespaceKeys: ["model", "kannaadi", "result"], provenance: { runtime: "trusted-local-python" } };
     return new Response(JSON.stringify(body), { status: 200, headers: { "Content-Type": "application/json" } });
   });
 }
+
+test("keeps parallel models in the established compact attention and MLP visual language", async () => {
+  const graph = architecture();
+  graph.blockTopology = "parallel";
+  mockConnectedBackend(graph);
+  render(<App />);
+
+  await screen.findByRole("button", { name: "Select L5H3" });
+  const row = document.querySelector(".parallel-layer-row");
+  expect(row?.querySelector(".attention-stage .attention-block")).toBeInTheDocument();
+  expect(row?.querySelector(".mlp-stage .mlp-block")).toBeInTheDocument();
+  expect(document.querySelector(".parallel-attention-branch")).not.toBeInTheDocument();
+  expect(document.querySelector(".parallel-mlp-branch")).not.toBeInTheDocument();
+  expect(screen.queryByText("Canonical architecture graph")).not.toBeInTheDocument();
+});
 
 function runRecord(kind: RunRecord["kind"] = "clean"): RunRecord {
   const intervened = kind === "intervened" || kind === "patched";
@@ -313,4 +339,23 @@ test("keeps generated code separate from a persistent non-executing scratchpad",
   expect(editor).toHaveValue("# custom research\nprint('ready')");
   expect(localStorage.getItem("kannaadi.codeScratchpads")).toContain("custom research");
   expect(screen.getByText(/Code execution is intentionally disabled/)).toBeInTheDocument();
+});
+
+test("runs trusted local Python in the integrated Code Lab and renders a structured artifact", async () => {
+  mockConnectedBackend();
+  vi.spyOn(window, "confirm").mockReturnValue(true);
+  const user = userEvent.setup();
+  render(<App />);
+
+  await user.click(await screen.findByRole("button", { name: "Code" }));
+  await user.click(screen.getByRole("button", { name: "Code Lab" }));
+  expect(await screen.findByText(/live variables/)).toBeInTheDocument();
+  const editor = screen.getByRole("textbox", { name: "Executable Python cell" });
+  expect((editor as HTMLTextAreaElement).value).toContain("kannaadi");
+  await user.click(editor.closest(".code-cell")!.querySelector(".run-cell") as HTMLButtonElement);
+
+  expect(await screen.findByText("Head effects")).toBeInTheDocument();
+  expect(screen.getByText("L0H0")).toBeInTheDocument();
+  expect(screen.getByText("1.25")).toBeInTheDocument();
+  expect(localStorage.getItem("kannaadi.codeCells")).toContain("exec-1");
 });

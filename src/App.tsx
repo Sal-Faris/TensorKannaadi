@@ -57,6 +57,9 @@ import type {
   AttributionResult,
   AttentionResult,
   CausalEffect,
+  CodeArtifact,
+  CodeCell,
+  CodeSessionStatus,
   ComponentNode,
   ComponentGroup,
   ContrastResult,
@@ -425,6 +428,7 @@ export function App() {
         model={models.find((model) => model.id === modelId) || DEFAULT_MODEL}
         prompt={prompt}
         runs={runs}
+        onRunsChanged={setRuns}
         activeRun={activeRun}
         setActiveRunId={setActiveRunId}
         causalAblate={causalAblate}
@@ -585,6 +589,7 @@ function Workbench(props: {
   model: ModelCatalogEntry;
   prompt: string;
   runs: RunRecord[];
+  onRunsChanged: (runs: RunRecord[]) => void;
   activeRun: RunRecord | null;
   setActiveRunId: (runId: string) => void;
   causalAblate: (componentIds: string[], kind: "zero_ablation" | "mean_ablation", positions: number[] | null) => Promise<void>;
@@ -642,6 +647,7 @@ function Workbench(props: {
   const [groups, setGroups] = usePersistentJson<ComponentGroup[]>("kannaadi.groups", []);
   const [recipes, setRecipes] = usePersistentJson<InterventionRecipe[]>("kannaadi.interventionRecipes", []);
   const [scratchpads, setScratchpads] = usePersistentJson<Record<string, string>>("kannaadi.codeScratchpads", {});
+  const [codeCells, setCodeCells] = usePersistentJson<Record<string, CodeCell[]>>("kannaadi.codeCells", {});
   const [groupDialog, setGroupDialog] = useState(false);
   const [recipeDialog, setRecipeDialog] = useState(false);
   const [workspaceDialog, setWorkspaceDialog] = useState(false);
@@ -943,7 +949,7 @@ function Workbench(props: {
 
   const snapshot = (name: string): WorkspaceSnapshot => ({
     format: "kannaadi-workspace",
-    version: 3,
+    version: 4,
     name,
     savedAt: new Date().toISOString(),
     modelId: model.id,
@@ -963,6 +969,7 @@ function Workbench(props: {
     experimentSeries,
     recipes,
     scratchpads,
+    codeCells,
     results: { runs, contrast, effects, headSweep, mlpSweep, attribution, residual, datasetAblations },
     viewport: { zoom, pan },
   });
@@ -992,6 +999,7 @@ function Workbench(props: {
       setBottomHeight(saved.layout.bottomHeight);
       if (saved.recipes) setRecipes(saved.recipes);
       if (saved.scratchpads) setScratchpads(saved.scratchpads);
+      if (saved.codeCells) setCodeCells(saved.codeCells);
       if (saved.results) {
         setHeadSweep(saved.results.headSweep);
         setMlpSweep(saved.results.mlpSweep);
@@ -1085,6 +1093,10 @@ function Workbench(props: {
             datasetLoading={datasetLoading}
             scratchpad={scratchpads[model.id] ?? ""}
             onScratchpadChange={(value) => setScratchpads((current) => ({ ...current, [model.id]: value }))}
+            codeCells={codeCells[model.id] ?? []}
+            onCodeCellsChange={(value) => setCodeCells((current) => ({ ...current, [model.id]: value }))}
+            selection={selection}
+            onRunsChanged={props.onRunsChanged}
             run={activeRun}
             onSelectRun={setActiveRunId}
             onDatasetRecipe={(seriesId, recipeId) => runDatasetRecipe(seriesId, recipeId)}
@@ -1108,7 +1120,7 @@ function Workbench(props: {
             onHeadSweep={(kind) => void sweepHeads(kind)}
             onMlpSweep={(kind) => void sweepMlps(kind)}
             onAttribution={() => void computeAttribution()}
-            onExport={() => downloadResearchBundle({ architecture, model, run: activeRun, contrast, effects, headSweep, mlpSweep, attribution, datasetAblations, scratchpad: scratchpads[model.id] ?? "", selection, groups })}
+            onExport={() => downloadResearchBundle({ architecture, model, run: activeRun, contrast, effects, headSweep, mlpSweep, attribution, datasetAblations, scratchpad: scratchpads[model.id] ?? "", codeCells: codeCells[model.id] ?? [], selection, groups })}
             loading={evidenceLoading}
             error={evidenceError}
           />
@@ -1420,9 +1432,10 @@ function ModelBoundaryRow({ mode, architecture, selection, selectNode }: {
   selectNode: (node: ComponentNode, additive?: boolean) => void;
 }) {
   const additive = (event: React.MouseEvent) => event.shiftKey || event.ctrlKey || event.metaKey;
+  const addsPositionToResidual = Boolean(architecture.positionalEmbedding && architecture.positionalMechanism === "standard");
   const component = (node: ComponentNode) => <button key={node.id} data-component-id={node.id} className={selection.includes(node.id) ? "component-selected" : ""} onClick={(event) => selectNode(node, additive(event))}><ComponentGlyph kind={node.kind} />{node.label}<small>{node.activationPoints[0]}</small></button>;
   if (mode === "output") return <div className="model-boundary-row output"><span>Output / readout</span><div className="boundary-linear-flow"><span className="residual-boundary-node">final residual x<sub>L</sub></span><i>→</i>{component(architecture.finalNorm)}<i>→</i>{component(architecture.unembedding)}<i>→</i><span className="logits-node">Vocabulary logits <small>{architecture.vocabularySize.toLocaleString()} tokens</small></span></div></div>;
-  return <div className="model-boundary-row input"><span>Input / initialization</span><div className="input-boundary-flow"><span className="outside-model-node">Prompt <i>→</i> tokenizer <i>→</i> token IDs <small>outside model</small></span><i>→</i><div className="boundary-branches"><div><small>token IDs</small>{component(architecture.embedding)}</div>{architecture.positionalEmbedding ? <div><small>position indices</small>{component(architecture.positionalEmbedding)}</div> : <div className="position-mechanism"><small>position indices</small><span>{architecture.positionalMechanism}<b>applied inside attention</b></span></div>}</div>{architecture.positionalEmbedding ? <><span className="boundary-sum" title="Added once to form the initial residual stream">+</span><span className="residual-boundary-node">initial residual x<sub>0</sub></span></> : <><i>→</i><span className="residual-boundary-node">initial residual x<sub>0</sub><small>token embedding only</small></span></>}</div></div>;
+  return <div className="model-boundary-row input"><span>Input / initialization</span><div className="input-boundary-flow"><span className="outside-model-node">Prompt <i>→</i> tokenizer <i>→</i> token IDs <small>outside model</small></span><i>→</i><div className="boundary-branches"><div><small>token IDs</small>{component(architecture.embedding)}</div>{architecture.positionalEmbedding ? <div><small>position indices</small>{component(architecture.positionalEmbedding)}</div> : <div className="position-mechanism"><small>position indices</small><span>{architecture.positionalMechanism}<b>applied inside attention</b></span></div>}</div>{addsPositionToResidual ? <><span className="boundary-sum" title="Added once to form the initial residual stream">+</span><span className="residual-boundary-node">initial residual x<sub>0</sub></span></> : <><i>→</i><span className="residual-boundary-node">initial residual x<sub>0</sub><small>{architecture.positionalMechanism === "shortformer" ? "position signal enters attention" : "token embedding only"}</small></span></>}</div></div>;
 }
 
 function LayerRow({ layer, architecture, expanded, expandedHeads, selected, toggle, toggleHead, selectNode, contextNode, headOverlay, mlpOverlay }: {
@@ -1448,8 +1461,17 @@ function LayerRow({ layer, architecture, expanded, expandedHeads, selected, togg
       <button className="layer-index" onClick={toggle} aria-label={`${expanded ? "Collapse" : "Expand"} layer ${layer.index}`}><strong>{layer.index}</strong>{expanded ? <ChevronDown /> : <ChevronRight />}</button>
       <div className="parallel-residual-source"><button data-component-id={layer.residualPre.id} title={layer.residualPre.id} onClick={(event) => choose(layer.residualPre, event)}>x<sub>{layer.index}</sub></button><span /></div>
       <div className="parallel-branches">
-        <section className="parallel-attention-branch"><header><button className={selected.includes(layer.norm1.id) ? "component-selected" : ""} data-component-id={layer.norm1.id} onClick={(event) => choose(layer.norm1, event)}>{architecture.normType}</button><small>attention branch</small></header><button data-component-id={layer.attention.id} className={`attention-block ${selected.includes(layer.attention.id) ? "component-selected" : ""}`} onClick={(event) => choose(layer.attention, event)} onContextMenu={(event) => context(layer.attention, event)}>Multi-Head Attention</button>{expanded && <div className="heads-container" style={{ "--heads": architecture.nHeads } as CSSProperties}>{layer.heads.map((head) => { const effect = headOverlay?.effects.find((value) => value.componentId === head.id); return <button key={head.id} data-component-id={head.id} className={`${selected.includes(head.id) ? "component-selected" : ""} ${effect ? "causal-overlay" : ""}`} style={effect ? causalOverlayStyle(effect.delta, Math.max(Math.abs(headOverlay!.minimum), Math.abs(headOverlay!.maximum))) : undefined} title={effect ? `${shortComponentId(head.id)}: ${signed(effect.delta)} metric change` : head.id} onClick={(event) => choose(head, event)} onDoubleClick={() => toggleHead(head.id)} onContextMenu={(event) => context(head, event)} aria-label={`Select L${layer.index}H${head.head}`}>H{head.head}</button>; })}</div>}{expanded && openHead && <div className="head-internals"><header><span>{displayName(openHead)}</span><button onClick={() => toggleHead(openHead.id)}><X /></button></header><div>{openHead.children.map((child, index) => <span key={child.id}><button data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>{index < openHead.children.length - 1 && <i>→</i>}</span>)}</div></div>}</section>
-        <section className="parallel-mlp-branch"><header><button className={selected.includes(layer.norm2.id) ? "component-selected" : ""} data-component-id={layer.norm2.id} onClick={(event) => choose(layer.norm2, event)}>{architecture.normType}</button><small>MLP branch</small></header><button data-component-id={layer.mlp.id} className={`mlp-block ${selected.includes(layer.mlp.id) ? "component-selected" : ""} ${mlpEffect ? "causal-overlay" : ""}`} style={mlpEffect ? causalOverlayStyle(mlpEffect.delta, Math.max(Math.abs(mlpOverlay!.minimum), Math.abs(mlpOverlay!.maximum))) : undefined} onClick={(event) => choose(layer.mlp, event)} onContextMenu={(event) => context(layer.mlp, event)}>MLP ({architecture.dMlp ?? "hidden"})</button>{expanded && <div className="mlp-internals">{layer.mlp.children.map((child) => <button key={child.id} data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>)}</div>}</section>
+        <div className="attention-stage">
+          {expanded && <button className={`norm-chip ${selected.includes(layer.norm1.id) ? "component-selected" : ""}`} data-component-id={layer.norm1.id} onClick={(event) => choose(layer.norm1, event)}>{architecture.normType}</button>}
+          <button data-component-id={layer.attention.id} className={`attention-block ${selected.includes(layer.attention.id) ? "component-selected" : ""}`} onClick={(event) => choose(layer.attention, event)} onContextMenu={(event) => context(layer.attention, event)}><span>{expanded ? `Layer ${layer.index} attention` : "Multi-Head Attention"}</span>{expanded && <small>{architecture.nHeads} query heads · {architecture.nKeyValueHeads} KV heads</small>}</button>
+          {expanded && <div className="heads-container" style={{ "--heads": architecture.nHeads } as CSSProperties}>{layer.heads.map((head) => { const effect = headOverlay?.effects.find((value) => value.componentId === head.id); return <button key={head.id} data-component-id={head.id} className={`${selected.includes(head.id) ? "component-selected" : ""} ${effect ? "causal-overlay" : ""}`} style={effect ? causalOverlayStyle(effect.delta, Math.max(Math.abs(headOverlay!.minimum), Math.abs(headOverlay!.maximum))) : undefined} title={effect ? `${shortComponentId(head.id)}: ${signed(effect.delta)} metric change` : head.id} onClick={(event) => choose(head, event)} onDoubleClick={() => toggleHead(head.id)} onContextMenu={(event) => context(head, event)} aria-label={`Select L${layer.index}H${head.head}`}>H{head.head}{effect && <small>{signedCompact(effect.delta)}</small>}</button>; })}</div>}
+          {expanded && openHead && <div className="head-internals"><header><span>{displayName(openHead)}</span><button onClick={() => toggleHead(openHead.id)}><X /></button></header><div>{openHead.children.map((child, index) => <span key={child.id}><button data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>{index < openHead.children.length - 1 && <i>→</i>}</span>)}</div></div>}
+        </div>
+        <div className="mlp-stage">
+          {expanded && <button className={`norm-chip ${selected.includes(layer.norm2.id) ? "component-selected" : ""}`} data-component-id={layer.norm2.id} onClick={(event) => choose(layer.norm2, event)}>{architecture.normType}</button>}
+          <button data-component-id={layer.mlp.id} className={`mlp-block ${selected.includes(layer.mlp.id) ? "component-selected" : ""} ${mlpEffect ? "causal-overlay" : ""}`} style={mlpEffect ? causalOverlayStyle(mlpEffect.delta, Math.max(Math.abs(mlpOverlay!.minimum), Math.abs(mlpOverlay!.maximum))) : undefined} title={mlpEffect ? `MLP L${layer.index}: ${signed(mlpEffect.delta)} metric change` : layer.mlp.id} onClick={(event) => choose(layer.mlp, event)} onContextMenu={(event) => context(layer.mlp, event)}>{expanded ? `MLP (${architecture.dMlp ?? "hidden"})` : "MLP"}{mlpEffect && <small>{signedCompact(mlpEffect.delta)}</small>}</button>
+          {expanded && <div className="mlp-internals">{layer.mlp.children.map((child) => <button key={child.id} data-component-id={child.id} className={selected.includes(child.id) ? "component-selected" : ""} onClick={(event) => choose(child, event)}>{child.label}</button>)}</div>}
+        </div>
       </div>
       <div className="parallel-merge"><span>attn out</span><span>MLP out</span><button data-component-id={layer.residualMid.id} title="Attention and MLP outputs are added jointly to the input residual" onClick={(event) => choose(layer.residualMid, event)}><Plus /></button></div>
       <div className="parallel-residual-output"><span /><button data-component-id={layer.residualPost.id} title={layer.residualPost.id} onClick={(event) => choose(layer.residualPost, event)}>x<sub>{layer.index + 1}</sub></button></div>
@@ -1572,6 +1594,10 @@ function AnalysisPanel(props: {
   datasetLoading: boolean;
   scratchpad: string;
   onScratchpadChange: (value: string) => void;
+  codeCells: CodeCell[];
+  onCodeCellsChange: (cells: CodeCell[]) => void;
+  selection: string[];
+  onRunsChanged: (runs: RunRecord[]) => void;
   run: RunRecord | null;
   onSelectRun: (runId: string) => void;
   onDatasetRecipe: (seriesId: string, recipeId: string) => Promise<void>;
@@ -1599,10 +1625,10 @@ function AnalysisPanel(props: {
   loading: boolean;
   error: string | null;
 }) {
-  const { activeTab, setActiveTab, architecture, selected, model, prompt, runs, experimentSeries, recipes, datasetAblations, datasetLoading, scratchpad, onScratchpadChange, run, onSelectRun, onDatasetRecipe, attention, activation, residual, residualPosition, setResidualPosition, residualTargetTokenId, setResidualTargetTokenId, comparison, contrast, effect, headSweep, mlpSweep, sweepKind, setSweepKind, attribution, sweepLoading, attributionLoading, onHeadSweep, onMlpSweep, onAttribution, onExport, loading, error } = props;
+  const { activeTab, setActiveTab, architecture, selected, model, prompt, runs, experimentSeries, recipes, datasetAblations, datasetLoading, scratchpad, onScratchpadChange, codeCells, onCodeCellsChange, selection, onRunsChanged, run, onSelectRun, onDatasetRecipe, attention, activation, residual, residualPosition, setResidualPosition, residualTargetTokenId, setResidualTargetTokenId, comparison, contrast, effect, headSweep, mlpSweep, sweepKind, setSweepKind, attribution, sweepLoading, attributionLoading, onHeadSweep, onMlpSweep, onAttribution, onExport, loading, error } = props;
   const tabs: PanelTab[] = ["Tokens", "Experiments", "Alignment", "Attention", "QK / OV", "Logits", "Activations", "Residual Stream", "Causal Sweep", "Attribution", "Code"];
   let content: ReactNode;
-  if (activeTab === "Code") content = <CodePanel architecture={architecture} selected={selected} model={model} prompt={prompt} run={run} scratchpad={scratchpad} onScratchpadChange={onScratchpadChange} />;
+  if (activeTab === "Code") content = <IntegratedCodePanel architecture={architecture} selected={selected} selection={selection} model={model} prompt={prompt} run={run} scratchpad={scratchpad} onScratchpadChange={onScratchpadChange} cells={codeCells} onCellsChange={onCodeCellsChange} onRunsChanged={onRunsChanged} />;
   else if (activeTab === "Experiments") content = <ExperimentsPanel runs={runs} activeRun={run} onSelectRun={onSelectRun} series={experimentSeries} recipes={recipes} results={datasetAblations} loading={datasetLoading} onRunDataset={onDatasetRecipe} />;
   else if (activeTab === "Alignment") content = contrast ? <AlignmentPanel contrast={contrast} /> : <EvidencePrompt message="Open Contrast setup and run a clean/corrupted prompt pair to inspect token alignment." />;
   else if (activeTab === "Causal Sweep" && sweepLoading) content = <EvidenceLoading message={`Running exact batched ${sweepKind === "heads" ? "attention-head" : "MLP"} interventions…`} />;
@@ -1849,6 +1875,154 @@ function CodePanel({ architecture, selected, model, prompt, run, scratchpad, onS
   return <div className="code-panel research-code"><header><div className="code-mode"><button className={codeMode === "generated" ? "active" : ""} onClick={() => setCodeMode("generated")}>Generated</button><button className={codeMode === "scratchpad" ? "active" : ""} onClick={() => setCodeMode("scratchpad")}>Scratchpad <small>not executed</small></button></div><div className="code-actions"><button onClick={() => void navigator.clipboard?.writeText(activeCode)}><Code2 />Copy</button><button onClick={() => downloadTextFile(`${model.id}-kannaadi.py`, activeCode)} disabled={!activeCode}><Download />Export .py</button></div></header>{codeMode === "generated" ? <><pre>{lines.map((line, index) => <div key={`${index}-${line}`}><span className="line-number">{index + 1}</span><code><PythonLine line={line} /></code></div>)}</pre><footer><span>Generated from the current model, prompt, selection, and intervention.</span><button onClick={loadGenerated}>Use as scratchpad</button></footer></> : <><textarea aria-label="Python research scratchpad" spellCheck={false} value={scratchpad} onChange={(event) => onScratchpadChange(event.target.value)} placeholder="# Write bespoke TransformerLens analysis here…\n# This editor saves locally but never executes code." /><footer><span><Info />Saved with this model and workspace. Code execution is intentionally disabled in the GUI.</span>{scratchpad && <button onClick={() => onScratchpadChange("")}>Clear scratchpad</button>}</footer></>}</div>;
 }
 
+function IntegratedCodePanel({ architecture, selected, selection, model, prompt, run, scratchpad, onScratchpadChange, cells, onCellsChange, onRunsChanged }: {
+  architecture: ArchitectureGraph | null;
+  selected: ComponentNode | null;
+  selection: string[];
+  model: ModelCatalogEntry;
+  prompt: string;
+  run: RunRecord | null;
+  scratchpad: string;
+  onScratchpadChange: (value: string) => void;
+  cells: CodeCell[];
+  onCellsChange: (cells: CodeCell[]) => void;
+  onRunsChanged: (runs: RunRecord[]) => void;
+}) {
+  const [mode, setMode] = useState<"generated" | "lab">("generated");
+  const [trusted, setTrusted] = useState(false);
+  const [runningCell, setRunningCell] = useState<string | null>(null);
+  const [session, setSession] = useState<CodeSessionStatus | null>(null);
+  const [sessionError, setSessionError] = useState<string | null>(null);
+  const initialCellId = useRef(`cell-${crypto.randomUUID()}`);
+  const defaultCode = scratchpad || [
+    "# Kannaadi injects model, active_run, tokens, cache, selection, and kannaadi.",
+    "# The final expression is published back into this panel.",
+    run ? "active_run.top_predictions[:5]" : `kannaadi.run(${JSON.stringify(prompt)}, label="Code Lab run").top_predictions[:5]`,
+  ].join("\n");
+  const visibleCells: CodeCell[] = cells.length ? cells : [{
+    id: initialCellId.current,
+    code: defaultCode,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+    execution: null,
+  }];
+
+  useEffect(() => {
+    if (mode !== "lab" || !architecture) return;
+    let cancelled = false;
+    void api.codeSession().then((status) => {
+      if (!cancelled) { setSession(status); setSessionError(null); }
+    }).catch((error) => {
+      if (!cancelled) setSessionError(error instanceof Error ? error.message : "Code Lab session unavailable");
+    });
+    return () => { cancelled = true; };
+  }, [mode, architecture]);
+
+  const persistCells = (next: CodeCell[]) => {
+    onCellsChange(next);
+    if (next[0]) onScratchpadChange(next[0].code);
+  };
+  const updateCell = (cellId: string, update: Partial<CodeCell>) => {
+    persistCells(visibleCells.map((cell) => cell.id === cellId ? { ...cell, ...update, updatedAt: new Date().toISOString() } : cell));
+  };
+  const addCell = (code = "# Use model, tokens, cache, selection, or kannaadi here\n") => {
+    const now = new Date().toISOString();
+    persistCells([...visibleCells, { id: `cell-${crypto.randomUUID()}`, code, createdAt: now, updatedAt: now, execution: null }]);
+    setMode("lab");
+  };
+  const removeCell = (cellId: string) => {
+    const next = visibleCells.filter((cell) => cell.id !== cellId);
+    persistCells(next.length ? next : []);
+  };
+  const trustWorkspace = () => {
+    if (trusted) return true;
+    const approved = window.confirm("Run this workspace's Python locally? Code Lab has access to the loaded model process and your computer. Imported code is never run automatically.");
+    if (approved) setTrusted(true);
+    return approved;
+  };
+  const runCell = async (cell: CodeCell) => {
+    if (!architecture || runningCell || !trustWorkspace()) return;
+    setRunningCell(cell.id);
+    setSessionError(null);
+    try {
+      const execution = await api.executeCode(cell.code, cell.id, true, run?.id ?? null, selection);
+      updateCell(cell.id, { execution });
+      setSession(await api.codeSession());
+      onRunsChanged(await api.runs());
+    } catch (error) {
+      setSessionError(error instanceof Error ? error.message : "Python execution failed");
+    } finally {
+      setRunningCell(null);
+    }
+  };
+  const interrupt = async () => {
+    try { setSession(await api.interruptCode()); } catch (error) { setSessionError(error instanceof Error ? error.message : "Interrupt failed"); }
+  };
+  const restart = async () => {
+    try { setSession(await api.restartCodeSession()); setSessionError(null); } catch (error) { setSessionError(error instanceof Error ? error.message : "Session restart failed"); }
+  };
+  const selectedHook = selected?.activationPoints[0];
+  const insertCurrentContext = () => {
+    const code = selectedHook && run ? [
+      `# ${displayName(selected)} from the active run`,
+      `hook_name = ${JSON.stringify(selectedHook)}`,
+      "result = cache[hook_name]",
+      "kannaadi.publish(result, title=hook_name)",
+    ].join("\n") : run ? [
+      "# Active Kannaadi run context",
+      "{",
+      '    "run": active_run.label,',
+      '    "tokens": [token.display for token in active_run.tokens],',
+      '    "top_predictions": [item.model_dump(by_alias=True) for item in active_run.top_predictions[:10]],',
+      "}",
+    ].join("\n") : [
+      "# Create a real run using the already-loaded model",
+      `new_run = kannaadi.run(${JSON.stringify(prompt)}, label="Code Lab run")`,
+      "new_run.top_predictions[:10]",
+    ].join("\n");
+    addCell(code);
+  };
+
+  return <div className="integrated-code-panel">
+    <header className="integrated-code-header"><div><button className={mode === "generated" ? "active" : ""} onClick={() => setMode("generated")}>Generated recipe</button><button className={mode === "lab" ? "active" : ""} onClick={() => setMode("lab")}><Code2 />Code Lab</button></div><span className={`code-session-state ${session?.state ?? "idle"}`}><i />{architecture ? session?.state ?? "session ready" : "load a model"}</span></header>
+    {mode === "generated" ? <div className="generated-code-shell"><CodePanel architecture={architecture} selected={selected} model={model} prompt={prompt} run={run} scratchpad={scratchpad} onScratchpadChange={onScratchpadChange} /><button className="send-to-code-lab" onClick={insertCurrentContext}><Code2 />Open current context in Code Lab</button></div> :
+      <div className="code-lab">
+        <header className="code-lab-toolbar"><div><strong>Workspace Python</strong><span>{session?.namespaceKeys?.length ?? 0} live variables · model-scoped persistent namespace</span></div><div>{runningCell && <button onClick={() => void interrupt()}><X />Interrupt</button>}<button disabled={Boolean(runningCell) || !architecture} onClick={() => void restart()}><RotateCcw />Restart namespace</button><button disabled={!architecture} onClick={() => addCell()}><Plus />Cell</button></div></header>
+        {!trusted && <div className="code-trust"><Info /><div><strong>Trusted local execution</strong><span>Nothing runs automatically. The first Run asks for permission; trust is forgotten when this view is recreated.</span></div></div>}
+        {sessionError && <div className="code-session-error"><Info />{sessionError}</div>}
+        <div className="code-cell-list">{visibleCells.map((cell, index) => <section className="code-cell" key={cell.id}>
+          <header><span>In [{index + 1}]</span><div><button title="Copy cell" onClick={() => void navigator.clipboard?.writeText(cell.code)}><Code2 /></button><button title="Delete cell" disabled={visibleCells.length === 1} onClick={() => removeCell(cell.id)}><Trash2 /></button><button className="run-cell" disabled={!architecture || Boolean(runningCell)} onClick={() => void runCell(cell)}>{runningCell === cell.id ? <span className="spinner" /> : <Play />}Run</button></div></header>
+          <HighlightedPythonEditor value={cell.code} disabled={Boolean(runningCell)} onChange={(code) => updateCell(cell.id, { code })} onRun={() => void runCell(cell)} />
+          {cell.execution && <CodeCellOutput artifact={cell.execution.artifact} stdout={cell.execution.stdout} stderr={cell.execution.stderr} error={cell.execution.error} trace={cell.execution.traceback} status={cell.execution.status} duration={cell.execution.durationMs} />}
+        </section>)}</div>
+        <footer><Info /><span>Available automatically: <code>model</code>, <code>active_run</code>, <code>tokens</code>, <code>cache</code>, <code>selection</code>, <code>architecture</code>, <code>engine</code>, and <code>kannaadi</code>. Imported workspace code never auto-runs.</span></footer>
+      </div>}
+  </div>;
+}
+
+function HighlightedPythonEditor({ value, disabled, onChange, onRun }: { value: string; disabled: boolean; onChange: (value: string) => void; onRun: () => void }) {
+  const highlight = useRef<HTMLPreElement>(null);
+  const syncScroll = (target: HTMLTextAreaElement) => {
+    if (!highlight.current) return;
+    highlight.current.scrollTop = target.scrollTop;
+    highlight.current.scrollLeft = target.scrollLeft;
+  };
+  return <div className="highlighted-editor"><pre ref={highlight} aria-hidden="true">{value.split("\n").map((line, index) => <div key={`${index}-${line}`}><span>{index + 1}</span><code><PythonLine line={line || " "} /></code></div>)}</pre><textarea aria-label="Executable Python cell" disabled={disabled} spellCheck={false} value={value} onScroll={(event) => syncScroll(event.currentTarget)} onChange={(event) => onChange(event.target.value)} onKeyDown={(event) => { if ((event.ctrlKey || event.metaKey) && event.key === "Enter") { event.preventDefault(); onRun(); } }} /></div>;
+}
+
+function CodeCellOutput({ artifact, stdout, stderr, error, trace, status, duration }: { artifact: CodeArtifact; stdout: string; stderr: string; error: string | null; trace: string | null; status: "complete" | "error" | "interrupted"; duration: number }) {
+  const body = artifact.kind === "image" && typeof artifact.data === "string" ? <img src={artifact.data} alt={artifact.title} />
+    : artifact.kind === "table" && Array.isArray(artifact.data) ? <ArtifactTable rows={artifact.data as Record<string, unknown>[]} />
+      : artifact.kind === "text" ? <pre>{String(artifact.data ?? "")}</pre>
+        : artifact.kind !== "none" ? <pre>{JSON.stringify(artifact.data, null, 2)}</pre> : null;
+  return <div className={`code-cell-output ${status}`}><header><strong>{error || artifact.title}</strong><span>{status} · {duration} ms</span></header>{stdout && <section><small>stdout</small><pre>{stdout}</pre></section>}{stderr && <section><small>stderr</small><pre>{stderr}</pre></section>}{body}{Object.keys(artifact.metadata).length > 0 && <details><summary>Artifact metadata</summary><pre>{JSON.stringify(artifact.metadata, null, 2)}</pre></details>}{trace && <details open><summary>Traceback</summary><pre>{trace}</pre></details>}</div>;
+}
+
+function ArtifactTable({ rows }: { rows: Record<string, unknown>[] }) {
+  const columns = [...new Set(rows.flatMap((row) => Object.keys(row)))].slice(0, 30);
+  return <div className="artifact-table"><table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead><tbody>{rows.slice(0, 500).map((row, index) => <tr key={index}>{columns.map((column) => <td key={column}><code>{typeof row[column] === "object" ? JSON.stringify(row[column]) : String(row[column] ?? "")}</code></td>)}</tr>)}</tbody></table>{rows.length > 500 && <small>Showing 500 of {rows.length} rows.</small>}</div>;
+}
+
 function EvidenceEmpty({ tab, selected }: { tab: PanelTab; selected: ComponentNode | null }) {
   return <div className="evidence-empty"><div className="empty-evidence-icon">{tab === "Attention" ? <Sparkles /> : tab === "Tokens" ? <Braces /> : <Crosshair />}</div><div><h3>{tab}{selected ? ` · ${displayName(selected)}` : ""}</h3><p>Run a prompt to inspect model behavior.</p></div><button disabled><Play />Run required</button></div>;
 }
@@ -2059,7 +2233,7 @@ function downloadTextFile(name: string, contents: string): void {
   anchor.click();
   window.setTimeout(() => URL.revokeObjectURL(url), 0);
 }
-function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; model: ModelCatalogEntry; run: RunRecord | null; contrast: ContrastResult | null; effects: Record<string, CausalEffect>; headSweep: HeadSweepResult | null; mlpSweep: MlpSweepResult | null; attribution: AttributionResult | null; datasetAblations: DatasetAblationResult[]; scratchpad: string; selection: string[]; groups: ComponentGroup[] }) {
+function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; model: ModelCatalogEntry; run: RunRecord | null; contrast: ContrastResult | null; effects: Record<string, CausalEffect>; headSweep: HeadSweepResult | null; mlpSweep: MlpSweepResult | null; attribution: AttributionResult | null; datasetAblations: DatasetAblationResult[]; scratchpad: string; codeCells: CodeCell[]; selection: string[]; groups: ComponentGroup[] }) {
   const bundle = {
     format: "kannaadi-research-bundle",
     version: 1,
@@ -2077,6 +2251,7 @@ function downloadResearchBundle(data: { architecture: ArchitectureGraph | null; 
     directAttribution: data.attribution,
     datasetAblations: data.datasetAblations,
     codeScratchpad: data.scratchpad,
+    codeCells: data.codeCells,
     selection: data.selection,
     groups: data.groups,
   };

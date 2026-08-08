@@ -3,6 +3,8 @@ import type {
   ArchitectureGraph,
   AttentionResult,
   AttributionResult,
+  CodeExecutionResult,
+  CodeSessionStatus,
   ContrastResult,
   DatasetAblationResult,
   HeadSweepResult,
@@ -234,6 +236,25 @@ export class KannaadiApi {
 
   compare(baselineRunId: string, intervenedRunId: string): Promise<RunComparison> {
     return this.request(`/api/v1/runs/${encodeURIComponent(baselineRunId)}/compare/${encodeURIComponent(intervenedRunId)}`);
+  }
+
+  codeSession(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/session");
+  }
+
+  executeCode(code: string, cellId: string, trusted: boolean, activeRunId: string | null, selection: string[]): Promise<CodeExecutionResult> {
+    return this.request("/api/v1/code/execute", {
+      method: "POST",
+      body: JSON.stringify({ code, cellId, trusted, activeRunId, selection }),
+    });
+  }
+
+  interruptCode(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/interrupt", { method: "POST" });
+  }
+
+  restartCodeSession(): Promise<CodeSessionStatus> {
+    return this.request("/api/v1/code/restart", { method: "POST" });
   }
 
   private async request<T = unknown>(path: string, init: RequestInit = {}): Promise<T> {

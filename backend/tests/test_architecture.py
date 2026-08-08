@@ -115,3 +115,77 @@ def test_parallel_blocks_do_not_claim_a_nonexistent_mid_residual_hook() -> None:
     assert graph.block_topology == "parallel"
     assert graph.layers[0].residual_mid.id == "blocks.0.parallel_merge"
     assert graph.layers[0].residual_mid.activation_points == []
+
+
+def test_canonical_flow_has_explicit_directed_serial_residual_adds() -> None:
+    architecture = graph()
+    modules = {module.id: module for module in architecture.flow.modules}
+    edges = {edge.id: edge for edge in architecture.flow.edges}
+
+    assert architecture.flow.schema_version == 1
+    assert modules["input.embedding_sum"].metadata["operator"] == "add"
+    assert edges["block.0.resid.attn_add"].source_module_id == "block.0.resid_pre"
+    assert edges["block.0.attn.add"].target_module_id == "block.0.add_attention"
+    assert edges["block.0.mlp.add"].target_module_id == "block.0.add_mlp"
+    assert edges["output.norm.unembed"].target_module_id == "output.unembedding"
+    assert all(edge.source_module_id != edge.target_module_id for edge in architecture.flow.edges)
+
+
+def test_parallel_flow_merges_attention_and_mlp_from_the_same_residual() -> None:
+    architecture = TransformerLensAdapter.from_dimensions(
+        ModelSpec(id="parallel", display_name="Parallel", backend="transformer_lens"),
+        n_layers=1,
+        n_heads=2,
+        d_model=16,
+        vocabulary_size=100,
+        block_topology="parallel",
+        positional_mechanism="rotary",
+    )
+    edges = {edge.id: edge for edge in architecture.flow.edges}
+
+    assert edges["block.0.resid.ln1"].source_module_id == "block.0.resid_pre"
+    assert edges["block.0.resid.ln2"].source_module_id == "block.0.resid_pre"
+    assert edges["block.0.resid.merge"].target_module_id == "block.0.merge"
+    assert edges["block.0.attn.merge"].target_module_id == "block.0.merge"
+    assert edges["block.0.mlp.merge"].target_module_id == "block.0.merge"
+    assert edges["block.0.position.attention"].tensor_role == "position_indices"
+
+
+def test_shortformer_position_embedding_enters_attention_not_initial_residual() -> None:
+    architecture = TransformerLensAdapter.from_dimensions(
+        ModelSpec(id="shortformer", display_name="Shortformer", backend="transformer_lens"),
+        n_layers=1,
+        n_heads=2,
+        d_model=16,
+        vocabulary_size=100,
+        positional_mechanism="shortformer",
+    )
+    edges = {edge.id: edge for edge in architecture.flow.edges}
+    modules = {module.id: module for module in architecture.flow.modules}
+
+    assert architecture.positional_embedding is not None
+    assert "input.embedding_sum" not in modules
+    assert edges["input.initial_residual"].source_module_id == "input.token_embedding"
+    assert edges["block.0.position.attention"].source_module_id == "input.position_embedding"
+
+
+def test_gated_mlp_exposes_both_branches_and_the_real_transformer_lens_hooks() -> None:
+    architecture = TransformerLensAdapter.from_dimensions(
+        ModelSpec(id="gated", display_name="Gated", backend="transformer_lens"),
+        n_layers=1,
+        n_heads=2,
+        d_model=16,
+        d_mlp=48,
+        vocabulary_size=100,
+        activation="silu",
+        gated_mlp=True,
+    )
+    mlp = architecture.layers[0].mlp
+
+    assert mlp.metadata["gated"] is True
+    assert [child.label for child in mlp.children] == [
+        "Gate projection", "Value projection", "silu × value", "Linear out",
+    ]
+    assert mlp.children[0].activation_points == ["blocks.0.mlp.hook_pre"]
+    assert mlp.children[1].activation_points == ["blocks.0.mlp.hook_pre_linear"]
+    assert mlp.children[2].activation_points == ["blocks.0.mlp.hook_post"]

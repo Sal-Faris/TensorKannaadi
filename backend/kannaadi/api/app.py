@@ -16,6 +16,12 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
 
 from kannaadi.adapters import TransformerLensAdapter
+from kannaadi.code_execution import (
+    CodeExecutionRequest,
+    CodeExecutionResult,
+    CodeSession,
+    CodeSessionStatus,
+)
 from kannaadi.domain import (
     AblationRequest,
     ActivationSeries,
@@ -70,6 +76,7 @@ class RuntimeState:
         self.lock = threading.Lock()
         self.adapter: TransformerLensAdapter | None = None
         self.experiments: ExperimentEngine | None = None
+        self.code_session: CodeSession | None = None
         self.loaded_model_id: str | None = None
         self.loaded_model_name: str | None = None
         self.device = "cpu"
@@ -100,6 +107,7 @@ class RuntimeState:
                 self.set_load_stage("initializing_experiments", "Initializing the experiment engine")
                 self.adapter = adapter
                 self.experiments = ExperimentEngine(adapter, graph, spec)
+                self.code_session = CodeSession(self.experiments, adapter, graph, spec.id)
                 self.loaded_model_id = spec.id
                 self.loaded_model_name = spec.display_name
                 self.device = spec.device
@@ -111,6 +119,7 @@ class RuntimeState:
             except Exception as exc:
                 self.adapter = None
                 self.experiments = None
+                self.code_session = None
                 self.loaded_model_id = None
                 self.loaded_model_name = None
                 self.load_state = "error"
@@ -130,7 +139,7 @@ class ApiTokenMiddleware(BaseHTTPMiddleware):
         return await call_next(request)
 
 
-app = FastAPI(title="Kannaadi API", version="0.6.0")
+app = FastAPI(title="Kannaadi API", version="0.7.0")
 app.state.api_token = None
 app.state.runtime = RuntimeState()
 app.add_middleware(ApiTokenMiddleware)
@@ -313,6 +322,44 @@ def experiment_engine(request: Request) -> ExperimentEngine:
     if runtime.experiments is None or runtime.adapter is None:
         raise HTTPException(status_code=409, detail="Load a model before running an experiment")
     return runtime.experiments
+
+
+def code_session(request: Request) -> CodeSession:
+    runtime: RuntimeState = request.app.state.runtime
+    if runtime.code_session is None or runtime.experiments is None:
+        raise HTTPException(status_code=409, detail="Load a model before opening an executable Code Lab session")
+    return runtime.code_session
+
+
+@app.get("/api/v1/code/session", response_model=CodeSessionStatus, response_model_by_alias=True)
+def code_session_status(request: Request) -> CodeSessionStatus:
+    return code_session(request).status()
+
+
+@app.post("/api/v1/code/execute", response_model=CodeExecutionResult, response_model_by_alias=True)
+async def execute_code(payload: CodeExecutionRequest, request: Request) -> CodeExecutionResult:
+    session = code_session(request)
+    try:
+        return await run_in_threadpool(session.execute, payload)
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.post("/api/v1/code/interrupt", response_model=CodeSessionStatus, response_model_by_alias=True)
+def interrupt_code(request: Request) -> CodeSessionStatus:
+    return code_session(request).interrupt()
+
+
+@app.post("/api/v1/code/restart", response_model=CodeSessionStatus, response_model_by_alias=True)
+def restart_code_session(request: Request) -> CodeSessionStatus:
+    try:
+        return code_session(request).restart()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
 
 
 def run_error(exc: Exception) -> HTTPException:

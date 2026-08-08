@@ -35,6 +35,46 @@ export type LayerNode = {
   residualPost: ComponentNode;
 };
 
+export type FlowPort = {
+  id: string;
+  label: string;
+  direction: "input" | "output";
+  tensorRole: string;
+  shape: (string | number)[];
+};
+
+export type FlowModule = {
+  id: string;
+  label: string;
+  role: string;
+  kind: ComponentKind | "model" | "stage" | "tokenizer" | "logits";
+  parentId: string | null;
+  componentId: string | null;
+  layer?: number;
+  ports: FlowPort[];
+  childIds: string[];
+  metadata: Record<string, unknown>;
+};
+
+export type FlowEdge = {
+  id: string;
+  sourceModuleId: string;
+  sourcePortId: string;
+  targetModuleId: string;
+  targetPortId: string;
+  kind: "data" | "residual" | "add" | "readout";
+  tensorRole: string;
+  label: string | null;
+};
+
+export type CanonicalFlowGraph = {
+  schemaVersion: number;
+  rootModuleId: string;
+  modules: FlowModule[];
+  edges: FlowEdge[];
+  capabilities: string[];
+};
+
 export type ArchitectureGraph = {
   modelId: string;
   displayName: string;
@@ -55,6 +95,46 @@ export type ArchitectureGraph = {
   layers: LayerNode[];
   finalNorm: ComponentNode;
   unembedding: ComponentNode;
+  flow: CanonicalFlowGraph;
+};
+
+export type CodeArtifact = {
+  kind: "none" | "text" | "json" | "table" | "tensor" | "image";
+  title: string;
+  data: unknown;
+  metadata: Record<string, unknown>;
+};
+
+export type CodeExecutionResult = {
+  id: string;
+  cellId: string | null;
+  status: "complete" | "error" | "interrupted";
+  stdout: string;
+  stderr: string;
+  artifact: CodeArtifact;
+  error: string | null;
+  traceback: string | null;
+  durationMs: number;
+  startedAt: string;
+  finishedAt: string;
+  namespaceKeys: string[];
+  provenance: Record<string, unknown>;
+};
+
+export type CodeSessionStatus = {
+  state: "idle" | "running" | "interrupting";
+  executionId: string | null;
+  startedAt: string | null;
+  namespaceKeys: string[];
+  trustModel: string;
+};
+
+export type CodeCell = {
+  id: string;
+  code: string;
+  createdAt: string;
+  updatedAt: string;
+  execution: CodeExecutionResult | null;
 };
 
 export type RuntimeStatus = {
@@ -411,7 +491,7 @@ export type WorkspaceResults = {
 
 export type WorkspaceSnapshot = {
   format: "kannaadi-workspace";
-  version: 1 | 2 | 3;
+  version: 1 | 2 | 3 | 4;
   name: string;
   savedAt: string;
   modelId: string;
@@ -431,6 +511,7 @@ export type WorkspaceSnapshot = {
   experimentSeries?: ExperimentSeries[];
   recipes?: InterventionRecipe[];
   scratchpads?: Record<string, string>;
+  codeCells?: Record<string, CodeCell[]>;
   results?: WorkspaceResults;
   viewport?: { zoom: number; pan: { x: number; y: number } };
 };

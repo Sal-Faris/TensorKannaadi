@@ -1,4 +1,13 @@
-from .architecture import ArchitectureGraph, ComponentNode, LayerNode, ModelSpec
+from .architecture import (
+    ArchitectureGraph,
+    CanonicalFlowGraph,
+    ComponentNode,
+    FlowEdge,
+    FlowModule,
+    FlowPort,
+    LayerNode,
+    ModelSpec,
+)
 from .experiments import (
     AblationRequest,
     ActivationSeries,
@@ -41,11 +50,15 @@ __all__ = [
     "ActivationSeries",
     "AlignmentPair",
     "ArchitectureGraph",
+    "CanonicalFlowGraph",
     "AttentionResult",
     "AttributionEffect",
     "AttributionResult",
     "CausalEffect",
     "ComponentNode",
+    "FlowEdge",
+    "FlowModule",
+    "FlowPort",
     "ContrastRequest",
     "ContrastResult",
     "DatasetAblationRequest",

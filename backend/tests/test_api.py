@@ -1,9 +1,11 @@
 import pytest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from fastapi.testclient import TestClient
 
 from kannaadi.adapters import TransformerLensAdapter
 from kannaadi.api.app import RuntimeState, app
+from kannaadi.code_execution import CodeSession
 from kannaadi.domain import (
     AlignmentPair,
     AttributionEffect,
@@ -369,10 +371,34 @@ def test_dataset_ablation_returns_per_prompt_evidence_and_aggregate_statistics()
             "metric": {"targetToken": " Paris", "distractorToken": " Berlin", "position": -1},
         },
     )
-
     assert response.status_code == 200
     assert response.json()["rows"][0]["intervenedRunId"] == "run_ablation"
     assert response.json()["rows"][0]["intervenedRun"]["kind"] == "intervened"
     assert response.json()["rows"][0]["delta"] == -.75
     assert response.json()["summary"]["directionConsistency"] == 1
     assert "selected prompt set" in response.json()["caveat"]
+
+
+def test_code_lab_endpoint_requires_trust_and_returns_structured_output() -> None:
+    engine = ExperimentStub()
+    adapter = SimpleNamespace(model=SimpleNamespace(name="fake-model"))
+    app.state.runtime.adapter = adapter
+    app.state.runtime.experiments = engine
+    app.state.runtime.code_session = CodeSession(engine, adapter, graph(), "gpt2-small")
+
+    denied = client.post("/api/v1/code/execute", json={"code": "1 + 1", "trusted": False})
+    assert denied.status_code == 403
+
+    response = client.post("/api/v1/code/execute", json={
+        "code": "print('ready')\nkannaadi.table([{'component': selection[0], 'effect': 1.5}], title='Effects')",
+        "cellId": "cell-1",
+        "trusted": True,
+        "selection": ["blocks.1.mlp"],
+    })
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "complete"
+    assert payload["stdout"] == "ready\n"
+    assert payload["artifact"]["kind"] == "table"
+    assert payload["artifact"]["data"][0]["component"] == "blocks.1.mlp"
+    assert client.get("/api/v1/code/session").json()["state"] == "idle"

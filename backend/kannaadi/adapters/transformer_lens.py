@@ -4,6 +4,7 @@ from typing import Any, Callable, Iterable
 
 from kannaadi.adapters.base import ModelAdapter
 from kannaadi.domain import ArchitectureGraph, ComponentNode, LayerNode, ModelSpec
+from kannaadi.domain.architecture_flow import build_canonical_flow
 
 
 class TransformerLensAdapter(ModelAdapter):
@@ -110,6 +111,7 @@ class TransformerLensAdapter(ModelAdapter):
             block_topology="parallel" if bool(getattr(cfg, "parallel_attn_mlp", False)) else "serial",
             positional_mechanism=str(getattr(cfg, "positional_embedding_type", "standard")),
             activation=str(getattr(cfg, "act_fn", "activation")),
+            gated_mlp=bool(getattr(cfg, "gated_mlp", False)),
         )
 
     @staticmethod
@@ -128,6 +130,7 @@ class TransformerLensAdapter(ModelAdapter):
         block_topology: str = "serial",
         positional_mechanism: str = "standard",
         activation: str = "gelu_new",
+        gated_mlp: bool = False,
     ) -> ArchitectureGraph:
         resolved_d_head = d_head or d_model // n_heads
         layers: list[LayerNode] = []
@@ -189,15 +192,25 @@ class TransformerLensAdapter(ModelAdapter):
                     ComponentNode(id=f"blocks.{layer}.ln2.normalized", label="Normalized", kind="operation", layer=layer, activationPoints=[f"blocks.{layer}.ln2.hook_normalized"]),
                 ],
             )
-            mlp = ComponentNode(
-                id=f"blocks.{layer}.mlp", label="MLP", kind="mlp", layer=layer,
-                activationPoints=[f"blocks.{layer}.hook_mlp_out"],
-                metadata={"activation": activation, "d_mlp": d_mlp},
-                children=[
+            mlp_children = (
+                [
+                    ComponentNode(id=f"blocks.{layer}.mlp.gate", label="Gate projection", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_pre"]),
+                    ComponentNode(id=f"blocks.{layer}.mlp.value", label="Value projection", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_pre_linear"]),
+                    ComponentNode(id=f"blocks.{layer}.mlp.activation", label=f"{activation} × value", kind="activation", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_post"]),
+                    ComponentNode(id=f"blocks.{layer}.mlp.out", label="Linear out", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.hook_mlp_out"]),
+                ]
+                if gated_mlp else
+                [
                     ComponentNode(id=f"blocks.{layer}.mlp.in", label="Linear in", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_pre"]),
                     ComponentNode(id=f"blocks.{layer}.mlp.activation", label=activation, kind="activation", layer=layer, activationPoints=[f"blocks.{layer}.mlp.hook_post"]),
                     ComponentNode(id=f"blocks.{layer}.mlp.out", label="Linear out", kind="projection", layer=layer, activationPoints=[f"blocks.{layer}.hook_mlp_out"]),
-                ],
+                ]
+            )
+            mlp = ComponentNode(
+                id=f"blocks.{layer}.mlp", label="MLP", kind="mlp", layer=layer,
+                activationPoints=[f"blocks.{layer}.hook_mlp_out"],
+                metadata={"activation": activation, "d_mlp": d_mlp, "gated": gated_mlp},
+                children=mlp_children,
             )
             residual_post = ComponentNode(id=f"blocks.{layer}.resid_post", label="Residual post", kind="residual", layer=layer, activationPoints=[f"blocks.{layer}.hook_resid_post"])
             layers.append(LayerNode(
@@ -205,6 +218,34 @@ class TransformerLensAdapter(ModelAdapter):
                 norm1=norm1, attention=attention, heads=heads, residualMid=residual_mid,
                 norm2=norm2, mlp=mlp, residualPost=residual_post,
             ))
+        embedding = ComponentNode(id="embed", label="Token embedding", kind="embedding", activationPoints=["hook_embed"])
+        positional_embedding = (
+            ComponentNode(id="pos_embed", label="Positional embedding", kind="embedding", activationPoints=["hook_pos_embed"], metadata={"mechanism": positional_mechanism})
+            if positional_mechanism in {"standard", "shortformer"} else None
+        )
+        final_norm = ComponentNode(
+            id="ln_final", label="Final normalization", kind="normalization",
+            activationPoints=["ln_final.hook_normalized"],
+            children=[
+                ComponentNode(id="ln_final.scale", label="Scale", kind="operation", activationPoints=["ln_final.hook_scale"]),
+                ComponentNode(id="ln_final.normalized", label="Normalized", kind="operation", activationPoints=["ln_final.hook_normalized"]),
+            ],
+        )
+        unembedding = ComponentNode(
+            id="unembed", label="Unembedding", kind="unembedding",
+            activationPoints=["unembed.hook_in", "unembed.hook_out"],
+        )
+        flow = build_canonical_flow(
+            embedding=embedding,
+            positional_embedding=positional_embedding,
+            layers=layers,
+            final_norm=final_norm,
+            unembedding=unembedding,
+            block_topology=block_topology,
+            positional_mechanism=positional_mechanism,
+            norm_type=norm_type,
+            n_key_value_heads=n_key_value_heads or n_heads,
+        )
         return ArchitectureGraph(
             modelId=spec.id,
             displayName=spec.display_name,
@@ -220,24 +261,12 @@ class TransformerLensAdapter(ModelAdapter):
             normalizationPosition=normalization_position,
             blockTopology=block_topology,
             positionalMechanism=positional_mechanism,
-            embedding=ComponentNode(id="embed", label="Token embedding", kind="embedding", activationPoints=["hook_embed"]),
-            positionalEmbedding=(
-                ComponentNode(id="pos_embed", label="Positional embedding", kind="embedding", activationPoints=["hook_pos_embed"], metadata={"mechanism": positional_mechanism})
-                if positional_mechanism in {"standard", "shortformer"} else None
-            ),
+            embedding=embedding,
+            positionalEmbedding=positional_embedding,
             layers=layers,
-            finalNorm=ComponentNode(
-                id="ln_final", label="Final normalization", kind="normalization",
-                activationPoints=["ln_final.hook_normalized"],
-                children=[
-                    ComponentNode(id="ln_final.scale", label="Scale", kind="operation", activationPoints=["ln_final.hook_scale"]),
-                    ComponentNode(id="ln_final.normalized", label="Normalized", kind="operation", activationPoints=["ln_final.hook_normalized"]),
-                ],
-            ),
-            unembedding=ComponentNode(
-                id="unembed", label="Unembedding", kind="unembedding",
-                activationPoints=["unembed.hook_in", "unembed.hook_out"],
-            ),
+            finalNorm=final_norm,
+            unembedding=unembedding,
+            flow=flow,
         )
 
     def tokenize(self, prompts: Iterable[str]) -> Any:

@@ -4,7 +4,7 @@ Kannaadi is a desktop-first visual workbench for mechanistic interpretability. I
 
 ## Current milestone
 
-Version 0.6.0 turns Kannaadi into a persistent experiment workbench: reusable prompt libraries and batches, intervention recipes, cross-run comparisons, position-aware residual vocabulary readouts, a low-glare observatory theme, and verified Pythia support now sit alongside the component-level causal tools introduced in 0.5.
+Version 0.7.0 adds the architecture and code foundations for paper-scale workflows: a renderer-independent modular transformer graph now records explicit tensor ports, directed edges, residual additions, component nesting, and serial/parallel topology, while an integrated trusted-local Code Lab covers bespoke TransformerLens work that has not yet become a GUI method.
 
 - Native Windows window with desktop-owned sidecar startup and shutdown
 - Loopback-only FastAPI service on a reserved per-launch port
@@ -38,6 +38,13 @@ Version 0.6.0 turns Kannaadi into a persistent experiment workbench: reusable pr
 - Explicit, model-faithful input and output boundaries: tokenizer outside the model, embeddings summed once into the initial residual, then final normalization and unembedding
 - Registration of another TransformerLens model name or compatible local Hugging Face-format directory
 - Transformers 5 compatibility shims and real-model validation for `EleutherAI/pythia-70m`
+- Canonical architecture IR v1 with nestable modules, typed tensor ports, explicit directed edges, residual-add operators, topology capabilities, and stable links back to TransformerLens component IDs
+- Correct positional routing in the architecture IR: learned absolute embeddings enter the initial residual once, Shortformer position vectors enter attention, and rotary position indices enter attention without an invented residual addition
+- Model-derived gated MLP modules expose their gate projection, value projection, gated activation, and output projection using the corresponding TransformerLens hook points
+- Expandable architecture-schema overview that summarizes model-derived input, repeated-block, and output modules without placing every detail on the main canvas
+- Integrated model-scoped Code Lab with persistent cells, syntax highlighting, Ctrl/Command+Enter execution, stdout/stderr/tracebacks, persistent Python variables, structured table/tensor/image artifacts, interrupt, and namespace restart
+- Live Code Lab context for `model`, `active_run`, `tokens`, `cache`, `selection`, `architecture`, `engine`, and the higher-level `kannaadi` helper; code-created runs reappear in the GUI
+- Explicit local-code trust prompt and provenance. Imported workspace code is saved but never executed automatically
 
 ## Run the desktop app
 
@@ -108,7 +115,7 @@ Tauri desktop process
 
 The sidecar listens only on `127.0.0.1`. The native process reserves a free port, creates a fresh 48-character token, starts Python without a console window, streams logs, detects crashes, and terminates the child when the app exits. The webview receives the connection information through a Tauri command instead of a file or a fixed secret.
 
-The frontend consumes normalized domain objects and does not infer architecture from the selected model name. Head IDs remain canonical even though TransformerLens stores head outputs in a shared hook tensor; each head records its slice metadata. On Windows, native workspace files are stored under `%APPDATA%\io.github.sal-faris.tensor-kannaadi\workspaces`; the browser-only development fallback uses local storage.
+The frontend consumes normalized domain objects and does not infer architecture from the selected model name. The adapter emits a canonical flow graph whose modules carry explicit input/output ports and whose edges define computation direction independently of screen layout. Head IDs remain canonical even though TransformerLens stores head outputs in a shared hook tensor; each head records its slice metadata. On Windows, native workspace files are stored under `%APPDATA%\io.github.sal-faris.tensor-kannaadi\workspaces`; the browser-only development fallback uses local storage.
 
 ## Repository layout
 
@@ -123,8 +130,9 @@ The frontend consumes normalized domain objects and does not infer architecture 
 
 - Interactive tensors are currently limited to 512 prompt tokens and live in memory for the current desktop session. Versioned workspace files persist model registrations, experiment definitions, and numeric result summaries; live activation tensors are deliberately recomputed after restart.
 - Current causal interventions target attention-head results, whole MLP outputs, and post-activation MLP neurons. Collection-scale ablation statistics are available; path patching, gradients, attribution patching, paired-collection activation patching, and whole-model dataset sweeps remain future workflows.
-- The normalized architecture renderer currently targets TransformerLens-compatible decoder-only models with attention/MLP blocks. Unsupported or unusual architectures may load in TransformerLens but still need a dedicated Kannaadi architecture adapter.
+- The canonical architecture IR represents serial and parallel TransformerLens-compatible decoder-only blocks. Encoder/decoder cross-attention, mixture-of-experts routing, recurrent state, and other unusual families still need dedicated adapters and render modules; unknown topology must never be silently presented as GPT-2.
 - Model registration accepts TransformerLens identifiers and compatible local Hugging Face directories; a standalone weight file cannot describe enough topology to load safely.
 - TransformerLens 3.x is introducing `TransformerBridge`. Kannaadi keeps backend-specific behavior behind one adapter so the loading path can migrate without changing experiment manifests or the frontend.
-- Arbitrary custom-script execution is not enabled. The editable scratchpad is deliberately non-executing, locally persistent, and exportable so the desktop app cannot silently run untrusted Python; execution happens in the researcher's chosen Python environment.
+- Code Lab executes arbitrary trusted Python locally in the model sidecar and is not a security sandbox. Code can mutate the model process and access the computer with the user's Python permissions. Imported cells never auto-run, every newly created view requires explicit trust before its first execution, and a namespace restart does not undo external filesystem or network effects.
+- Python-level loops are interruptible; a native PyTorch/CUDA kernel may finish before interruption takes effect. Restarting the namespace clears user variables but deliberately keeps the already-loaded model and GUI run cache.
 - Resumable background jobs, plugin APIs, installer signing, whole-model dataset sweeps, and unusual non-decoder architecture renderers remain future milestones.
